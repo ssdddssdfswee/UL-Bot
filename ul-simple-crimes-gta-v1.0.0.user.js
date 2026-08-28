@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Underworld Legacy - Crimes & GTA
 // @namespace    https://underworldlegacy.com/
-// @version      1.3.1
+// @version      1.3.3
 // @description  Small API-first Crimes, GTA, jailbust and safely filtered melting automation panel for Underworld Legacy.
 // @author       Aphotic
 // @match        https://underworldlegacy.com/*
@@ -407,11 +407,20 @@
     }
   }
 
+  function jailInmateIdentifier(inmate) {
+    return String((inmate && (inmate.id || inmate.username)) || '').trim();
+  }
+
   function chooseJailBustCandidate(data) {
     if (!state.settings.jailBust || data.inJail === true) return null;
-    const playerId = String(data.playerId || '');
+    // Older/local builds expose internal player IDs. The current live API
+    // intentionally exposes usernames instead, so support both contracts.
+    const viewerIdentifier = String(data.playerId || data.viewerUsername || '').trim().toLocaleLowerCase();
     const inmates = (Array.isArray(data.inmates) ? data.inmates : [])
-      .filter((inmate) => inmate && String(inmate.id || '') && String(inmate.id) !== playerId);
+      .filter((inmate) => {
+        const identifier = jailInmateIdentifier(inmate);
+        return identifier && identifier.toLocaleLowerCase() !== viewerIdentifier;
+      });
 
     inmates.sort((left, right) => {
       const leftReward = bigintOrZero(left.bustReward);
@@ -425,6 +434,8 @@
   async function runJailBust() {
     const inmate = state.jailBustCandidate;
     if (!inmate || state.jailBustRunning || state.inJail) return;
+    const inmateIdentifier = jailInmateIdentifier(inmate);
+    if (!inmateIdentifier) return;
 
     state.jailBustCandidate = null;
     state.jailBustRunning = true;
@@ -432,10 +443,11 @@
     render();
     try {
       await queueAction(
-        `/api/jail/bust/${encodeURIComponent(String(inmate.id))}`,
+        `/api/jail/bust/${encodeURIComponent(inmateIdentifier)}`,
         `Busting ${inmate.username || 'player'}`,
         { skipDelay: true },
       );
+      state.jailBustCandidate = null;
       state.jailBustDueAt = Date.now() + 50;
       state.jailDueAt = 0;
     } catch (error) {
@@ -464,6 +476,7 @@
     state.jailRunning = true;
     state.jailBustCandidate = null;
     const requestStartedAt = Date.now();
+    let bustImmediately = false;
     try {
       const data = await api('/api/jail');
       const wasInJail = state.inJail;
@@ -474,6 +487,7 @@
         state.jailMarkedAt = 0;
       }
       state.jailBustCandidate = chooseJailBustCandidate(data);
+      bustImmediately = state.jailBustCandidate !== null && !state.jailBustRunning;
       if (state.settings.jailBust && !state.inJail) {
         state.jailDueAt = Date.now() + JAIL_BUST_SCAN_MS;
       } else {
@@ -496,6 +510,9 @@
       state.jailDueAt = Date.now() + errorBackoff(error);
     } finally {
       state.jailRunning = false;
+      // Do not wait for the ordinary feature scheduler. Crimes may be processing
+      // several ready actions, and inmates can disappear within milliseconds.
+      if (bustImmediately) void runJailBust();
       refreshIdleStatus();
     }
   }
@@ -548,7 +565,7 @@
     }
 
     const now = Date.now();
-    if (!state.jailRunning && state.jailDueAt <= now) void checkJail();
+    if (!state.jailRunning && !state.jailBustRunning && state.jailDueAt <= now) void checkJail();
     if (state.jailRunning) return;
     if (state.inJail) return;
     if (state.settings.crimes && !state.crimesRunning && state.crimesDueAt <= now) {
