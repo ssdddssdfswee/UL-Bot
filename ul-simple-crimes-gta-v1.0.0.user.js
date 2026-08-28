@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         Underworld Legacy - Crimes & GTA
 // @namespace    https://underworldlegacy.com/
-// @version      1.2.1
-// @description  Small API-first Crimes, GTA and safely filtered melting automation panel for Underworld Legacy.
-// @author       Aphotic
+// @version      1.3.0
+// @description  Small API-first Crimes, GTA, jailbust and safely filtered melting automation panel for Underworld Legacy.
+// @author       Crisy
 // @match        https://underworldlegacy.com/*
 // @match        https://www.underworldlegacy.com/*
 // @match        http://localhost:3000/*
@@ -33,6 +33,7 @@
     enabled: false,
     crimes: true,
     gta: true,
+    jailBust: false,
     melt: false,
     meltCommon: true,
     meltRare: false,
@@ -55,12 +56,15 @@
     lastAction: 'None yet',
     crimesDueAt: 0,
     gtaDueAt: 0,
+    jailBustDueAt: 0,
     meltDueAt: 0,
     jailDueAt: 0,
     crimesRunning: false,
     gtaRunning: false,
+    jailBustRunning: false,
     meltRunning: false,
     jailRunning: false,
+    jailBustCandidate: null,
     actionTail: Promise.resolve(),
     logs: [],
   };
@@ -94,6 +98,7 @@
       enabled: value.enabled === true,
       crimes: value.crimes !== false,
       gta: value.gta !== false,
+      jailBust: value.jailBust === true,
       melt: value.melt === true,
       meltCommon: value.meltCommon !== false,
       meltRare: value.meltRare === true,
@@ -144,6 +149,7 @@
   function wakeAll() {
     state.crimesDueAt = 0;
     state.gtaDueAt = 0;
+    state.jailBustDueAt = 0;
     state.meltDueAt = 0;
     state.jailDueAt = 0;
   }
@@ -151,6 +157,7 @@
   function markJailed() {
     state.inJail = true;
     state.jailMarkedAt = Date.now();
+    state.jailBustCandidate = null;
     state.jailDueAt = 0;
   }
 
@@ -391,8 +398,65 @@
     }
   }
 
+  function bigintOrZero(value) {
+    try {
+      return BigInt(String(value ?? '0'));
+    } catch {
+      return 0n;
+    }
+  }
+
+  function chooseJailBustCandidate(data) {
+    if (!state.settings.jailBust || data.inJail === true) return null;
+    const playerId = String(data.playerId || '');
+    const inmates = (Array.isArray(data.inmates) ? data.inmates : [])
+      .filter((inmate) => inmate && String(inmate.id || '') && String(inmate.id) !== playerId);
+
+    inmates.sort((left, right) => {
+      const leftReward = bigintOrZero(left.bustReward);
+      const rightReward = bigintOrZero(right.bustReward);
+      if (leftReward !== rightReward) return leftReward > rightReward ? -1 : 1;
+      return Number(left.secondsRemaining || 0) - Number(right.secondsRemaining || 0);
+    });
+    return inmates[0] || null;
+  }
+
+  async function runJailBust() {
+    const inmate = state.jailBustCandidate;
+    if (!inmate || state.jailBustRunning || state.inJail) return;
+
+    state.jailBustCandidate = null;
+    state.jailBustRunning = true;
+    state.currentAction = `Preparing to bust ${inmate.username || 'player'}`;
+    render();
+    try {
+      await queueAction(
+        `/api/jail/bust/${encodeURIComponent(String(inmate.id))}`,
+        `Busting ${inmate.username || 'player'}`,
+      );
+      state.jailBustDueAt = Date.now() + 1_000;
+      state.jailDueAt = 0;
+    } catch (error) {
+      if (error instanceof ApiError && (
+        (error.body && error.body.success === false) ||
+        /cannot bust players while you are in jail|got caught trying to bust/i.test(error.message)
+      )) {
+        log(error.message, 'warn');
+        markJailed();
+      } else if (!(error instanceof ActionCancelledError)) {
+        handleTaskError('Jailbust', error);
+        state.jailBustDueAt = Date.now() + errorBackoff(error);
+      }
+      state.jailDueAt = 0;
+    } finally {
+      state.jailBustRunning = false;
+      refreshIdleStatus();
+    }
+  }
+
   async function checkJail() {
     state.jailRunning = true;
+    state.jailBustCandidate = null;
     const requestStartedAt = Date.now();
     try {
       const data = await api('/api/jail');
@@ -403,6 +467,7 @@
         state.inJail = false;
         state.jailMarkedAt = 0;
       }
+      state.jailBustCandidate = chooseJailBustCandidate(data);
       state.jailDueAt = nextTimeFromSeconds(state.inJail ? Math.min(Number(data.secondsRemaining) || 3, 3) : 3, 3);
 
       if (wasInJail && !state.inJail) {
@@ -459,7 +524,7 @@
     else if (state.authRequired) state.currentAction = 'Log in to Underworld Legacy';
     else if (!state.controller) state.currentAction = 'Standby — another tab is active';
     else if (state.inJail) state.currentAction = 'Paused while in jail';
-    else if (!state.crimesRunning && !state.gtaRunning && !state.meltRunning && !state.jailRunning) state.currentAction = 'Waiting for next action';
+    else if (!state.crimesRunning && !state.gtaRunning && !state.jailBustRunning && !state.meltRunning && !state.jailRunning) state.currentAction = 'Waiting for next action';
     render();
   }
 
@@ -478,6 +543,11 @@
       return;
     }
     if (state.crimesRunning) return;
+    if (state.settings.jailBust && state.jailBustCandidate && !state.jailBustRunning && state.jailBustDueAt <= now) {
+      void runJailBust();
+      return;
+    }
+    if (state.jailBustRunning) return;
     if (state.settings.gta && !state.gtaRunning && state.gtaDueAt <= now) void runGta();
     if (state.settings.melt && !state.meltRunning && state.meltDueAt <= now) void runMelt();
   }
@@ -499,6 +569,7 @@
           <button type="button" id="ul-simple-toggle">Start</button>
           <label><input type="checkbox" id="ul-simple-crimes"> Crimes</label>
           <label><input type="checkbox" id="ul-simple-gta"> GTA</label>
+          <label title="Failed attempts can send your character to jail"><input type="checkbox" id="ul-simple-jailbust"> Jailbust</label>
           <label><input type="checkbox" id="ul-simple-melt"> Melt</label>
         </div>
         <div class="ul-simple-melt-filter">
@@ -556,6 +627,7 @@
     const toggle = host.querySelector('#ul-simple-toggle');
     const crimes = host.querySelector('#ul-simple-crimes');
     const gta = host.querySelector('#ul-simple-gta');
+    const jailBust = host.querySelector('#ul-simple-jailbust');
     const melt = host.querySelector('#ul-simple-melt');
     const meltCommon = host.querySelector('#ul-simple-melt-common');
     const meltRare = host.querySelector('#ul-simple-melt-rare');
@@ -574,6 +646,12 @@
     gta.addEventListener('change', () => {
       saveSettings({ gta: gta.checked });
       state.gtaDueAt = 0;
+    });
+    jailBust.addEventListener('change', () => {
+      saveSettings({ jailBust: jailBust.checked });
+      state.jailBustCandidate = null;
+      state.jailBustDueAt = 0;
+      state.jailDueAt = 0;
     });
     melt.addEventListener('change', () => {
       saveSettings({ melt: melt.checked });
@@ -612,6 +690,7 @@
     toggle.classList.toggle('running', state.settings.enabled);
     host.querySelector('#ul-simple-crimes').checked = state.settings.crimes;
     host.querySelector('#ul-simple-gta').checked = state.settings.gta;
+    host.querySelector('#ul-simple-jailbust').checked = state.settings.jailBust;
     host.querySelector('#ul-simple-melt').checked = state.settings.melt;
     host.querySelector('#ul-simple-melt-common').checked = state.settings.meltCommon;
     host.querySelector('#ul-simple-melt-common').disabled = !state.settings.melt;
