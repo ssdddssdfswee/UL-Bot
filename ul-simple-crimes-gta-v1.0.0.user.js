@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         Underworld Legacy - Crimes & GTA
 // @namespace    https://underworldlegacy.com/
-// @version      1.3.0
+// @version      1.3.1
 // @description  Small API-first Crimes, GTA, jailbust and safely filtered melting automation panel for Underworld Legacy.
-// @author       Crisy
+// @author       Aphotic
 // @match        https://underworldlegacy.com/*
 // @match        https://www.underworldlegacy.com/*
 // @match        http://localhost:3000/*
@@ -21,6 +21,7 @@
   const SETTINGS_KEY = 'ul_simple_crimes_gta_settings_v1';
   const CONTROLLER_LOCK = 'ul-simple-crimes-gta-controller-v1';
   const BOT_TAB_KEY = 'ul_simple_crimes_gta_bot_tab_v1';
+  const JAIL_BUST_SCAN_MS = 250;
   const NEVER_MELT_CAR_NAMES = new Set([
     'Tuner',
     'RS Tuner',
@@ -433,8 +434,9 @@
       await queueAction(
         `/api/jail/bust/${encodeURIComponent(String(inmate.id))}`,
         `Busting ${inmate.username || 'player'}`,
+        { skipDelay: true },
       );
-      state.jailBustDueAt = Date.now() + 1_000;
+      state.jailBustDueAt = Date.now() + 50;
       state.jailDueAt = 0;
     } catch (error) {
       if (error instanceof ApiError && (
@@ -443,6 +445,10 @@
       )) {
         log(error.message, 'warn');
         markJailed();
+      } else if (error instanceof ApiError && error.status === 400 && /not in jail|no longer in jail/i.test(error.message)) {
+        // Another player beat us to this inmate. Refresh immediately instead of
+        // applying the normal error backoff, so the next inmate can be attempted.
+        state.jailBustDueAt = Date.now() + 50;
       } else if (!(error instanceof ActionCancelledError)) {
         handleTaskError('Jailbust', error);
         state.jailBustDueAt = Date.now() + errorBackoff(error);
@@ -468,7 +474,14 @@
         state.jailMarkedAt = 0;
       }
       state.jailBustCandidate = chooseJailBustCandidate(data);
-      state.jailDueAt = nextTimeFromSeconds(state.inJail ? Math.min(Number(data.secondsRemaining) || 3, 3) : 3, 3);
+      if (state.settings.jailBust && !state.inJail) {
+        state.jailDueAt = Date.now() + JAIL_BUST_SCAN_MS;
+      } else {
+        state.jailDueAt = nextTimeFromSeconds(
+          state.inJail ? Math.min(Number(data.secondsRemaining) || 3, 3) : 3,
+          3,
+        );
+      }
 
       if (wasInJail && !state.inJail) {
         log('Released from jail — resuming actions', 'ok');
