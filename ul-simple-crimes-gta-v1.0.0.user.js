@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         Underworld Legacy - Crimes & GTA
+// @name         Underworld Legacy - Crimes, GTA, Melt & Drugs
 // @namespace    https://underworldlegacy.com/
-// @version      1.3.3
-// @description  Small API-first Crimes, GTA, jailbust and safely filtered melting automation panel for Underworld Legacy.
-// @author       Aphotic
+// @version      1.4.0
+// @description  Small API-first Crimes, GTA, jailbust, safely filtered melting and optimal drug-run automation panel for Underworld Legacy.
+// @author       Crisy
 // @match        https://underworldlegacy.com/*
 // @match        https://www.underworldlegacy.com/*
 // @match        http://localhost:3000/*
@@ -17,11 +17,23 @@
 (() => {
   'use strict';
 
-  const SCRIPT_NAME = 'UL Crimes, GTA & Melt';
+  const SCRIPT_NAME = 'UL Crimes, GTA, Melt & Drugs';
   const SETTINGS_KEY = 'ul_simple_crimes_gta_settings_v1';
   const CONTROLLER_LOCK = 'ul-simple-crimes-gta-controller-v1';
   const BOT_TAB_KEY = 'ul_simple_crimes_gta_bot_tab_v1';
   const JAIL_BUST_SCAN_MS = 250;
+  const DRUG_ROUTE = Object.freeze({
+    russia: { buy: 'heroin', next: 'usa' },
+    usa: { buy: 'lsd', next: 'south africa' },
+    'south africa': { buy: 'ecstasy', next: 'russia' },
+  });
+  const DRUG_SELL_DESTINATIONS = Object.freeze({
+    cannabis: 'russia',
+    heroin: 'usa',
+    cocaine: 'england',
+    ecstasy: 'russia',
+    lsd: 'south africa',
+  });
   const NEVER_MELT_CAR_NAMES = new Set([
     'Tuner',
     'RS Tuner',
@@ -39,6 +51,8 @@
     meltCommon: true,
     meltRare: false,
     repairBeforeMelt: false,
+    drugs: false,
+    drugRepairDamage: 60,
     minDelayMs: 150,
     maxDelayMs: 350,
   });
@@ -59,13 +73,18 @@
     gtaDueAt: 0,
     jailBustDueAt: 0,
     meltDueAt: 0,
+    drugsDueAt: 0,
     jailDueAt: 0,
     crimesRunning: false,
     gtaRunning: false,
     jailBustRunning: false,
     meltRunning: false,
+    drugsRunning: false,
     jailRunning: false,
     jailBustCandidate: null,
+    drugContextLoaded: false,
+    drugFavouriteCarId: null,
+    drugStatus: 'Drugs not checked',
     actionTail: Promise.resolve(),
     logs: [],
   };
@@ -104,6 +123,8 @@
       meltCommon: value.meltCommon !== false,
       meltRare: value.meltRare === true,
       repairBeforeMelt: value.repairBeforeMelt === true,
+      drugs: value.drugs === true,
+      drugRepairDamage: clampInteger(value.drugRepairDamage, 1, 99, DEFAULT_SETTINGS.drugRepairDamage),
       minDelayMs: Math.min(minimum, maximum),
       maxDelayMs: Math.max(minimum, maximum),
     };
@@ -114,6 +135,7 @@
     GM_setValue(SETTINGS_KEY, state.settings);
     if (patch.enabled === true) {
       state.stoppedForDeath = false;
+      if (state.settings.drugs) state.drugContextLoaded = false;
       wakeAll();
     }
     render();
@@ -152,6 +174,7 @@
     state.gtaDueAt = 0;
     state.jailBustDueAt = 0;
     state.meltDueAt = 0;
+    state.drugsDueAt = 0;
     state.jailDueAt = 0;
   }
 
@@ -225,7 +248,7 @@
       state.currentAction = label;
       render();
 
-      const result = await api(path, { method: 'POST' });
+      const result = await api(path, { method: 'POST', body: options.body });
       const message = cleanMessage(result.html) || label;
       log(message, result.success === false ? 'warn' : 'ok');
       if (result.success === false || /sent to (?:the )?jail/i.test(message)) {
@@ -331,6 +354,11 @@
   function canMeltCar(car) {
     if (!car || typeof car.name !== 'string') return false;
     if (car.protectedFromMelt === true) return false;
+    if (
+      state.settings.drugs &&
+      state.drugFavouriteCarId !== null &&
+      Number(car.publicId) === state.drugFavouriteCarId
+    ) return false;
     if (NEVER_MELT_CAR_NAMES.has(car.name) || car.rarity === 'veryRare') return false;
     if (car.rarity === 'normal') return state.settings.meltCommon;
     if (car.rarity === 'rare') return state.settings.meltRare;
@@ -353,22 +381,26 @@
       }
 
       const groups = Array.isArray(overview.groups) ? overview.groups : [];
-      const eligibleGroup = groups.find((group) => Number(group.count) > 0 && canMeltCar(group));
-      if (!eligibleGroup) {
+      const eligibleGroups = groups.filter((group) => Number(group.count) > 0 && canMeltCar(group));
+      if (eligibleGroups.length === 0) {
         state.meltDueAt = Date.now() + 30_000;
         return;
       }
 
+      const eligibleNames = new Set(eligibleGroups.map((group) => group.name));
       let car = (Array.isArray(overview.cars) ? overview.cars : [])
-        .find((candidate) => candidate.name === eligibleGroup.name && canMeltCar(candidate));
+        .find((candidate) => eligibleNames.has(candidate.name) && canMeltCar(candidate));
 
       if (!car) {
-        const filtered = await api(`/api/melt?page=1&filter=${encodeURIComponent(eligibleGroup.name)}`);
-        if (!filtered.available) {
-          state.meltDueAt = nextTimeFromSeconds(filtered.secondsRemaining, 5);
-          return;
+        for (const eligibleGroup of eligibleGroups) {
+          const filtered = await api(`/api/melt?page=1&filter=${encodeURIComponent(eligibleGroup.name)}`);
+          if (!filtered.available) {
+            state.meltDueAt = nextTimeFromSeconds(filtered.secondsRemaining, 5);
+            return;
+          }
+          car = (Array.isArray(filtered.cars) ? filtered.cars : []).find(canMeltCar);
+          if (car) break;
         }
-        car = (Array.isArray(filtered.cars) ? filtered.cars : []).find(canMeltCar);
       }
 
       const publicId = Number(car && car.publicId);
@@ -395,6 +427,163 @@
       state.meltDueAt = Date.now() + errorBackoff(error);
     } finally {
       state.meltRunning = false;
+      refreshIdleStatus();
+    }
+  }
+
+  function normaliseDrugLabel(value) {
+    const label = String(value || '').trim().toLocaleLowerCase();
+    if (label === 'united states' || label === 'united states of america') return 'usa';
+    return label;
+  }
+
+  function drugLotId(lot) {
+    return normaliseDrugLabel(lot && (lot.drugId || lot.name));
+  }
+
+  function findDrugLocation(data, wantedLocation) {
+    const wanted = normaliseDrugLabel(wantedLocation);
+    return (Array.isArray(data.locations) ? data.locations : [])
+      .find((location) => normaliseDrugLabel(location && location.name) === wanted) || null;
+  }
+
+  function nextDrugDriveCheck(data) {
+    const seconds = Number(data.driveSecondsRemaining);
+    return Date.now() + (Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 + 50 : 500);
+  }
+
+  async function repairDrugCarIfRequired(favouriteCar) {
+    if (!favouriteCar || Number(favouriteCar.damage || 0) < state.settings.drugRepairDamage) return false;
+    const publicId = Number(favouriteCar.publicId);
+    if (!Number.isSafeInteger(publicId) || publicId <= 0) {
+      state.drugStatus = `Drug car needs repair, but its car ID is unavailable`;
+      state.drugsDueAt = Date.now() + 10_000;
+      return true;
+    }
+    await queueAction(
+      `/api/gta/cars/${encodeURIComponent(String(publicId))}/repair`,
+      `Repairing drug car ${favouriteCar.name || ''}`.trim(),
+    );
+    state.drugsDueAt = Date.now() + 50;
+    return true;
+  }
+
+  async function runDrugs() {
+    state.drugsRunning = true;
+    state.currentAction = 'Checking drug run';
+    render();
+    try {
+      const data = await api('/api/drugs?page=1');
+      const location = normaliseDrugLabel(data.location);
+      const displayLocation = String(data.location || 'Unknown');
+      const capacity = Math.max(0, Number(data.capacity ?? data.rankCapacity) || 0);
+      const unitsHeld = Math.max(0, Number(data.unitsHeld) || 0);
+      const inventory = Array.isArray(data.inventory) ? data.inventory.filter((lot) => lot && lot.id) : [];
+      const favouriteCar = data.favouriteCar && typeof data.favouriteCar === 'object' ? data.favouriteCar : null;
+      const favouriteCarId = Number(favouriteCar && favouriteCar.publicId);
+
+      state.drugContextLoaded = true;
+      state.drugFavouriteCarId = Number.isSafeInteger(favouriteCarId) && favouriteCarId > 0 ? favouriteCarId : null;
+      state.drugStatus = `${displayLocation}: ${unitsHeld.toLocaleString('en-GB')}/${capacity.toLocaleString('en-GB')} drug units${
+        favouriteCar ? ` · ${favouriteCar.name} ${Number(favouriteCar.damage || 0)}% damage` : ' · no favourite car'
+      }`;
+
+      // Sell only lots whose intended profitable destination is the current city.
+      const lotsToSell = inventory.filter((lot) => DRUG_SELL_DESTINATIONS[drugLotId(lot)] === location);
+      if (lotsToSell.length > 0) {
+        await queueAction('/api/drugs/sell', `Selling drugs in ${displayLocation}`, {
+          body: { ids: lotsToSell.map((lot) => String(lot.id)) },
+        });
+        state.drugsDueAt = Date.now() + 50;
+        return;
+      }
+
+      // Existing stock always takes priority. Carry it to its best sell city
+      // rather than liquidating it at a loss or mixing it with the next load.
+      if (inventory.length > 0 || unitsHeld > 0) {
+        const carriedLot = inventory.find((lot) => DRUG_SELL_DESTINATIONS[drugLotId(lot)]);
+        const destinationName = carriedLot ? DRUG_SELL_DESTINATIONS[drugLotId(carriedLot)] : null;
+        if (!destinationName) {
+          state.drugStatus += ' · unsupported held drug';
+          state.drugsDueAt = Date.now() + 15_000;
+          return;
+        }
+        if (!favouriteCar) {
+          state.drugStatus += ' · favourite a car to continue';
+          state.drugsDueAt = Date.now() + 10_000;
+          return;
+        }
+        if (await repairDrugCarIfRequired(favouriteCar)) return;
+        if (data.driveAvailable !== true) {
+          state.drugsDueAt = nextDrugDriveCheck(data);
+          return;
+        }
+        const destination = findDrugLocation(data, destinationName);
+        if (!destination) {
+          state.drugStatus += ` · ${destinationName} destination unavailable`;
+          state.drugsDueAt = Date.now() + 10_000;
+          return;
+        }
+        await queueAction('/api/drugs/drive', `Driving to ${destination.name} with drugs`, {
+          body: { location: Number(destination.id) },
+        });
+        state.drugsDueAt = Date.now() + 50;
+        return;
+      }
+
+      const routeStep = DRUG_ROUTE[location];
+      if (!favouriteCar) {
+        state.drugStatus += ' · favourite a car to begin';
+        state.drugsDueAt = Date.now() + 10_000;
+        return;
+      }
+      if (await repairDrugCarIfRequired(favouriteCar)) return;
+
+      // England/Mexico are not part of the optimal loop. Enter it at Russia.
+      if (!routeStep) {
+        if (data.driveAvailable !== true) {
+          state.drugsDueAt = nextDrugDriveCheck(data);
+          return;
+        }
+        const russia = findDrugLocation(data, 'russia');
+        if (!russia) {
+          state.drugStatus += ' · Russia destination unavailable';
+          state.drugsDueAt = Date.now() + 10_000;
+          return;
+        }
+        await queueAction('/api/drugs/drive', `Driving to ${russia.name} to start optimal route`, {
+          body: { location: Number(russia.id) },
+        });
+        state.drugsDueAt = Date.now() + 50;
+        return;
+      }
+
+      const market = Array.isArray(data.market) ? data.market : [];
+      const buyDrug = market.find((drug) => normaliseDrugLabel(drug && (drug.id || drug.name)) === routeStep.buy);
+      if (!buyDrug) {
+        state.drugStatus += ` · ${routeStep.buy} unavailable`;
+        state.drugsDueAt = Date.now() + 10_000;
+        return;
+      }
+      const remainingCapacity = Math.max(0, capacity - unitsHeld);
+      const price = bigintOrZero(buyDrug.price);
+      const cash = bigintOrZero(data.money);
+      const affordable = price > 0n ? Number(cash / price) : 0;
+      const amount = Math.max(0, Math.min(remainingCapacity, Number.isSafeInteger(affordable) ? affordable : remainingCapacity));
+      if (amount <= 0) {
+        state.drugStatus += remainingCapacity <= 0 ? ' · capacity full' : ' · insufficient cash';
+        state.drugsDueAt = Date.now() + 15_000;
+        return;
+      }
+      await queueAction('/api/drugs/buy', `Buying ${amount.toLocaleString('en-GB')} ${buyDrug.name}`, {
+        body: { drug: String(buyDrug.id), amount },
+      });
+      state.drugsDueAt = Date.now() + 50;
+    } catch (error) {
+      if (!(error instanceof ActionCancelledError)) handleTaskError('Drugs', error);
+      state.drugsDueAt = Date.now() + errorBackoff(error);
+    } finally {
+      state.drugsRunning = false;
       refreshIdleStatus();
     }
   }
@@ -554,7 +743,7 @@
     else if (state.authRequired) state.currentAction = 'Log in to Underworld Legacy';
     else if (!state.controller) state.currentAction = 'Standby — another tab is active';
     else if (state.inJail) state.currentAction = 'Paused while in jail';
-    else if (!state.crimesRunning && !state.gtaRunning && !state.jailBustRunning && !state.meltRunning && !state.jailRunning) state.currentAction = 'Waiting for next action';
+    else if (!state.crimesRunning && !state.gtaRunning && !state.jailBustRunning && !state.meltRunning && !state.drugsRunning && !state.jailRunning) state.currentAction = 'Waiting for next action';
     render();
   }
 
@@ -578,8 +767,13 @@
       return;
     }
     if (state.jailBustRunning) return;
+    if (state.settings.drugs && !state.drugContextLoaded) {
+      if (!state.drugsRunning && state.drugsDueAt <= now) void runDrugs();
+      return;
+    }
     if (state.settings.gta && !state.gtaRunning && state.gtaDueAt <= now) void runGta();
     if (state.settings.melt && !state.meltRunning && state.meltDueAt <= now) void runMelt();
+    if (state.settings.drugs && !state.drugsRunning && state.drugsDueAt <= now) void runDrugs();
   }
 
   function createPanel() {
@@ -601,6 +795,7 @@
           <label><input type="checkbox" id="ul-simple-gta"> GTA</label>
           <label title="Failed attempts can send your character to jail"><input type="checkbox" id="ul-simple-jailbust"> Jailbust</label>
           <label><input type="checkbox" id="ul-simple-melt"> Melt</label>
+          <label><input type="checkbox" id="ul-simple-drugs"> Drugs</label>
         </div>
         <div class="ul-simple-melt-filter">
           <span>Melt:</span>
@@ -611,6 +806,12 @@
         <div class="ul-simple-protected" title="These types and every API-reported very rare car are always blocked from melting.">
           Never melts: Tuner, RS Tuner, Mythic, Hyper, Black or Orange
         </div>
+        <div class="ul-simple-drug-settings">
+          Drug car repair at
+          <input type="number" id="ul-simple-drug-repair-damage" min="1" max="99" step="1" aria-label="Drug car repair damage">
+          % damage
+        </div>
+        <div id="ul-simple-drug-status">Drugs not checked</div>
         <div class="ul-simple-delay">
           Other delay
           <input type="number" id="ul-simple-min-delay" min="0" max="10000" step="50" aria-label="Minimum delay">
@@ -642,6 +843,9 @@
       #ul-simple-bot .ul-simple-melt-filter { display:flex; gap:9px; align-items:center; margin-bottom:5px; color:#ccc; }
       #ul-simple-bot .ul-simple-melt-filter label { display:flex; gap:4px; align-items:center; }
       #ul-simple-bot .ul-simple-protected { margin-bottom:8px; padding:5px 6px; border:1px solid #5b4b2c; background:#211c12; color:#ffd36b; }
+      #ul-simple-bot .ul-simple-drug-settings { display:flex; gap:4px; align-items:center; color:#bbb; margin-bottom:5px; }
+      #ul-simple-bot .ul-simple-drug-settings input { width:48px; padding:3px; color:#eee; background:#1b1b1b; border:1px solid #555; }
+      #ul-simple-bot #ul-simple-drug-status { margin-bottom:8px; color:#9fd5ff; }
       #ul-simple-bot .ul-simple-delay { display:flex; gap:4px; align-items:center; color:#bbb; margin-bottom:8px; }
       #ul-simple-bot .ul-simple-delay input { width:54px; padding:3px; color:#eee; background:#1b1b1b; border:1px solid #555; }
       #ul-simple-bot #ul-simple-last { padding:6px; background:#191919; border:1px solid #333; color:#ddd; }
@@ -659,9 +863,11 @@
     const gta = host.querySelector('#ul-simple-gta');
     const jailBust = host.querySelector('#ul-simple-jailbust');
     const melt = host.querySelector('#ul-simple-melt');
+    const drugs = host.querySelector('#ul-simple-drugs');
     const meltCommon = host.querySelector('#ul-simple-melt-common');
     const meltRare = host.querySelector('#ul-simple-melt-rare');
     const repairBeforeMelt = host.querySelector('#ul-simple-repair-before-melt');
+    const drugRepairDamage = host.querySelector('#ul-simple-drug-repair-damage');
     const minimum = host.querySelector('#ul-simple-min-delay');
     const maximum = host.querySelector('#ul-simple-max-delay');
     const tabMode = host.querySelector('#ul-simple-tab-mode');
@@ -687,6 +893,12 @@
       saveSettings({ melt: melt.checked });
       state.meltDueAt = 0;
     });
+    drugs.addEventListener('change', () => {
+      saveSettings({ drugs: drugs.checked });
+      state.drugContextLoaded = false;
+      state.drugFavouriteCarId = null;
+      state.drugsDueAt = 0;
+    });
     meltCommon.addEventListener('change', () => {
       saveSettings({ meltCommon: meltCommon.checked });
       state.meltDueAt = 0;
@@ -698,6 +910,10 @@
     repairBeforeMelt.addEventListener('change', () => {
       saveSettings({ repairBeforeMelt: repairBeforeMelt.checked });
       state.meltDueAt = 0;
+    });
+    drugRepairDamage.addEventListener('change', () => {
+      saveSettings({ drugRepairDamage: drugRepairDamage.value });
+      state.drugsDueAt = 0;
     });
     minimum.addEventListener('change', () => saveSettings({ minDelayMs: minimum.value }));
     maximum.addEventListener('change', () => saveSettings({ maxDelayMs: maximum.value }));
@@ -722,12 +938,16 @@
     host.querySelector('#ul-simple-gta').checked = state.settings.gta;
     host.querySelector('#ul-simple-jailbust').checked = state.settings.jailBust;
     host.querySelector('#ul-simple-melt').checked = state.settings.melt;
+    host.querySelector('#ul-simple-drugs').checked = state.settings.drugs;
     host.querySelector('#ul-simple-melt-common').checked = state.settings.meltCommon;
     host.querySelector('#ul-simple-melt-common').disabled = !state.settings.melt;
     host.querySelector('#ul-simple-melt-rare').checked = state.settings.meltRare;
     host.querySelector('#ul-simple-melt-rare').disabled = !state.settings.melt;
     host.querySelector('#ul-simple-repair-before-melt').checked = state.settings.repairBeforeMelt;
     host.querySelector('#ul-simple-repair-before-melt').disabled = !state.settings.melt;
+    host.querySelector('#ul-simple-drug-repair-damage').value = String(state.settings.drugRepairDamage);
+    host.querySelector('#ul-simple-drug-repair-damage').disabled = !state.settings.drugs;
+    host.querySelector('#ul-simple-drug-status').textContent = state.settings.drugs ? state.drugStatus : 'Drug run disabled';
     host.querySelector('#ul-simple-min-delay').value = String(state.settings.minDelayMs);
     host.querySelector('#ul-simple-max-delay').value = String(state.settings.maxDelayMs);
     const tabMode = host.querySelector('#ul-simple-tab-mode');
@@ -740,6 +960,7 @@
       host.querySelector('#ul-simple-melt-common').disabled = !state.settings.melt;
       host.querySelector('#ul-simple-melt-rare').disabled = !state.settings.melt;
       host.querySelector('#ul-simple-repair-before-melt').disabled = !state.settings.melt;
+      host.querySelector('#ul-simple-drug-repair-damage').disabled = !state.settings.drugs;
     }
     host.querySelector('#ul-simple-status').textContent = state.currentAction;
     host.querySelector('#ul-simple-last').textContent = `Last: ${state.lastAction}`;
