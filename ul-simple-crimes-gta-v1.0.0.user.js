@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Underworld Legacy - Crimes & GTA
 // @namespace    https://underworldlegacy.com/
-// @version      1.5.0
-// @description  Small API-first Crimes, GTA, jailbust, safely filtered melting, optimal drug runs and Auto Rank renewal for Underworld Legacy.
+// @version      1.6.1
+// @description  API-first crimes, GTA, jailbust, filtered melting, drug runs, Auto Rank renewal and player-search discovery for Underworld Legacy.
 // @author       Aphotic
 // @match        https://underworldlegacy.com/*
 // @match        https://www.underworldlegacy.com/*
@@ -17,11 +17,14 @@
 (() => {
   'use strict';
 
-  const SCRIPT_NAME = 'UL Crimes, GTA, Melt, Drugs & Rank';
+  const SCRIPT_NAME = 'UL Crimes, GTA, Melt, Drugs, Rank & Search';
   const SETTINGS_KEY = 'ul_simple_crimes_gta_settings_v1';
   const CONTROLLER_LOCK = 'ul-simple-crimes-gta-controller-v1';
   const BOT_TAB_KEY = 'ul_simple_crimes_gta_bot_tab_v1';
-  const JAIL_BUST_SCAN_MS = 250;
+  const PLAYER_LIST_KEY = 'ul_simple_player_list_v1';
+  const ONLINE_DISCOVERY_MS = 2 * 60_000;
+  const PLAYER_SEARCH_SPACING_MS = 1_000;
+  const PLAYER_SEARCH_RENEW_SECONDS = 60;
   const DRUG_ROUTE = Object.freeze({
     russia: { buy: 'heroin', next: 'usa' },
     usa: { buy: 'lsd', next: 'south africa' },
@@ -53,6 +56,8 @@
     repairBeforeMelt: false,
     drugs: false,
     autoRank: false,
+    discoverPlayers: false,
+    searchPlayers: false,
     drugRepairDamage: 60,
     minDelayMs: 150,
     maxDelayMs: 350,
@@ -76,6 +81,8 @@
     meltDueAt: 0,
     drugsDueAt: 0,
     autoRankDueAt: 0,
+    playerDiscoveryDueAt: 0,
+    playerSearchDueAt: 0,
     jailDueAt: 0,
     crimesRunning: false,
     gtaRunning: false,
@@ -83,6 +90,8 @@
     meltRunning: false,
     drugsRunning: false,
     autoRankRunning: false,
+    playerDiscoveryRunning: false,
+    playerSearchRunning: false,
     jailRunning: false,
     jailBustCandidate: null,
     drugContextLoaded: false,
@@ -91,6 +100,11 @@
     autoRankActive: false,
     autoRankEndsAt: 0,
     autoRankStatus: 'Auto Rank not checked',
+    playerNames: loadPlayerNames(),
+    viewerUsername: '',
+    playerDiscoveryStatus: 'Player discovery disabled',
+    playerSearchStatus: 'Player searching disabled',
+    playerSearchBackoff: new Map(),
     actionTail: Promise.resolve(),
     logs: [],
   };
@@ -131,10 +145,79 @@
       repairBeforeMelt: value.repairBeforeMelt === true,
       drugs: value.drugs === true,
       autoRank: value.autoRank === true,
+      discoverPlayers: value.discoverPlayers === true,
+      searchPlayers: value.searchPlayers === true,
       drugRepairDamage: clampInteger(value.drugRepairDamage, 1, 99, DEFAULT_SETTINGS.drugRepairDamage),
       minDelayMs: Math.min(minimum, maximum),
       maxDelayMs: Math.max(minimum, maximum),
     };
+  }
+
+  function normalisePlayerName(value) {
+    return String(value || '').trim().toLocaleLowerCase();
+  }
+
+  function validPlayerName(value) {
+    const name = String(value || '').trim();
+    return name && name.length <= 30 && normalisePlayerName(name) !== 'unknown' ? name : '';
+  }
+
+  function sanitisePlayerNames(values) {
+    const unique = new Map();
+    for (const value of Array.isArray(values) ? values : []) {
+      const name = validPlayerName(value);
+      if (name && !unique.has(normalisePlayerName(name))) unique.set(normalisePlayerName(name), name);
+    }
+    return [...unique.values()].sort((left, right) => left.localeCompare(right, undefined, { sensitivity: 'base' }));
+  }
+
+  function loadPlayerNames() {
+    return sanitisePlayerNames(GM_getValue(PLAYER_LIST_KEY, []));
+  }
+
+  function setViewerUsername(value) {
+    const name = validPlayerName(value);
+    if (!name) return;
+    state.viewerUsername = name;
+    const ownKey = normalisePlayerName(name);
+    const filtered = state.playerNames.filter((playerName) => normalisePlayerName(playerName) !== ownKey);
+    if (filtered.length !== state.playerNames.length) {
+      state.playerNames = filtered;
+      GM_setValue(PLAYER_LIST_KEY, state.playerNames);
+    }
+  }
+
+  function replacePlayerNames(values, message = '') {
+    const ownKey = normalisePlayerName(state.viewerUsername);
+    state.playerNames = sanitisePlayerNames(values).filter((name) => normalisePlayerName(name) !== ownKey);
+    GM_setValue(PLAYER_LIST_KEY, state.playerNames);
+    if (state.settings.searchPlayers) state.playerSearchDueAt = 0;
+    state.playerDiscoveryStatus = `${state.playerNames.length.toLocaleString('en-GB')} player${state.playerNames.length === 1 ? '' : 's'} collected`;
+    if (message) log(message, 'ok');
+    render();
+  }
+
+  function addDiscoveredPlayerNames(values, source) {
+    if (!state.settings.discoverPlayers) return 0;
+    const ownName = normalisePlayerName(state.viewerUsername);
+    const existing = new Map(state.playerNames.map((name) => [normalisePlayerName(name), name]));
+    let added = 0;
+    for (const value of values) {
+      const name = validPlayerName(value);
+      const key = normalisePlayerName(name);
+      if (!name || key === ownName || existing.has(key)) continue;
+      existing.set(key, name);
+      added += 1;
+    }
+    if (added > 0) {
+      state.playerNames = [...existing.values()].sort((left, right) => left.localeCompare(right, undefined, { sensitivity: 'base' }));
+      GM_setValue(PLAYER_LIST_KEY, state.playerNames);
+      state.playerSearchDueAt = 0;
+      log(`Discovered ${added} new player${added === 1 ? '' : 's'} from ${source}`, 'ok');
+    }
+    state.playerDiscoveryStatus = `${state.playerNames.length.toLocaleString('en-GB')} player${state.playerNames.length === 1 ? '' : 's'} collected`;
+    render();
+    return added;
   }
 
   function saveSettings(patch) {
@@ -183,6 +266,8 @@
     state.meltDueAt = 0;
     state.drugsDueAt = 0;
     state.autoRankDueAt = 0;
+    state.playerDiscoveryDueAt = 0;
+    state.playerSearchDueAt = 0;
     state.jailDueAt = 0;
   }
 
@@ -698,6 +783,132 @@
     return false;
   }
 
+  async function runPlayerDiscovery() {
+    if (state.playerDiscoveryRunning) return;
+    state.playerDiscoveryRunning = true;
+    state.currentAction = 'Checking visible online players';
+    render();
+    try {
+      const data = await api('/api/pages/online');
+      setViewerUsername(data.viewerUsername);
+      const visibleNames = (Array.isArray(data.players) ? data.players : [])
+        .filter((player) => player && player.usernameHidden !== true)
+        .map((player) => player.username);
+      addDiscoveredPlayerNames(visibleNames, 'Players Online');
+      state.playerDiscoveryDueAt = Date.now() + ONLINE_DISCOVERY_MS;
+    } catch (error) {
+      handleTaskError('Player discovery', error);
+      state.playerDiscoveryDueAt = Date.now() + errorBackoff(error);
+    } finally {
+      state.playerDiscoveryRunning = false;
+      refreshIdleStatus();
+    }
+  }
+
+  function discoverJailInmates(data) {
+    if (!state.settings.discoverPlayers) return;
+    setViewerUsername(data.viewerUsername);
+    const inmateNames = (Array.isArray(data.inmates) ? data.inmates : []).map((inmate) => inmate && inmate.username);
+    addDiscoveredPlayerNames(inmateNames, 'Jail');
+  }
+
+  function nextPlayerSearchCheck(data) {
+    const waits = [];
+    for (const pending of Array.isArray(data.pending) ? data.pending : []) {
+      const seconds = Number(pending.secondsUntilFound);
+      if (Number.isFinite(seconds)) waits.push(Math.max(1, seconds));
+    }
+    for (const found of Array.isArray(data.found) ? data.found : []) {
+      const seconds = Number(found.secondsRemaining) - PLAYER_SEARCH_RENEW_SECONDS;
+      if (Number.isFinite(seconds)) waits.push(Math.max(1, seconds));
+    }
+    const seconds = waits.length ? Math.min(...waits) : 60;
+    // Recheck at least once every five minutes so list edits or searches made
+    // elsewhere are eventually reflected without continuously polling.
+    return Date.now() + Math.min(5 * 60_000, seconds * 1000 + 100);
+  }
+
+  async function runPlayerSearch() {
+    if (state.playerSearchRunning) return;
+    state.playerSearchRunning = true;
+    state.currentAction = 'Checking kill-page searches';
+    render();
+    try {
+      const data = await api('/api/kill');
+      const viewer = validPlayerName(data.player && data.player.username);
+      if (viewer) setViewerUsername(viewer);
+      if (data.player && data.player.alive === false) {
+        state.playerSearchStatus = 'Character is dead — searches paused';
+        state.playerSearchDueAt = Date.now() + 60_000;
+        return;
+      }
+
+      const now = Date.now();
+      for (const [key, until] of state.playerSearchBackoff) {
+        if (until <= now) state.playerSearchBackoff.delete(key);
+      }
+      const pending = new Map((Array.isArray(data.pending) ? data.pending : [])
+        .map((row) => [normalisePlayerName(row.username), row]));
+      const found = new Map((Array.isArray(data.found) ? data.found : [])
+        .map((row) => [normalisePlayerName(row.username), row]));
+      const ownName = normalisePlayerName(state.viewerUsername);
+      const candidates = state.playerNames.filter((name) => {
+        const key = normalisePlayerName(name);
+        return key && key !== ownName && (state.playerSearchBackoff.get(key) || 0) <= now;
+      });
+
+      // Renew an already-found player shortly before expiry before starting a
+      // new target. This preserves a completed search without renewing pending
+      // searches or resetting their find timer.
+      let target = candidates.find((name) => {
+        const row = found.get(normalisePlayerName(name));
+        return row && Number(row.secondsRemaining) <= PLAYER_SEARCH_RENEW_SECONDS;
+      });
+      if (!target) {
+        target = candidates.find((name) => {
+          const key = normalisePlayerName(name);
+          return !pending.has(key) && !found.has(key);
+        });
+      }
+
+      if (!target) {
+        state.playerSearchStatus = state.playerNames.length
+          ? `${pending.size} pending · ${found.size} found`
+          : 'No players collected yet';
+        state.playerSearchDueAt = nextPlayerSearchCheck(data);
+        return;
+      }
+
+      try {
+        await queueAction('/api/kill/search', `Searching ${target} on the kill page`, {
+          body: { username: target },
+        });
+        state.playerSearchBackoff.delete(normalisePlayerName(target));
+        state.playerSearchStatus = `Last searched: ${target}`;
+        state.playerSearchDueAt = Date.now() + PLAYER_SEARCH_SPACING_MS;
+      } catch (error) {
+        if (error instanceof ActionCancelledError) throw error;
+        const message = error && error.message ? error.message : String(error);
+        const longBackoff = error instanceof ApiError && (
+          error.status === 404 || /dead|cannot be killed|protected from death|yourself/i.test(message)
+        );
+        state.playerSearchBackoff.set(
+          normalisePlayerName(target),
+          Date.now() + (longBackoff ? 6 * 60 * 60_000 : 15 * 60_000),
+        );
+        state.playerSearchStatus = `${target} temporarily skipped`;
+        log(`Kill search ${target}: ${message}`, 'warn');
+        state.playerSearchDueAt = Date.now() + PLAYER_SEARCH_SPACING_MS;
+      }
+    } catch (error) {
+      if (!(error instanceof ActionCancelledError)) handleTaskError('Player search', error);
+      state.playerSearchDueAt = Date.now() + errorBackoff(error);
+    } finally {
+      state.playerSearchRunning = false;
+      refreshIdleStatus();
+    }
+  }
+
   function jailInmateIdentifier(inmate) {
     return String((inmate && (inmate.id || inmate.username)) || '').trim();
   }
@@ -770,6 +981,7 @@
     let bustImmediately = false;
     try {
       const data = await api('/api/jail');
+      discoverJailInmates(data);
       const wasInJail = state.inJail;
       if (data.inJail === true) {
         markJailed();
@@ -780,7 +992,7 @@
       state.jailBustCandidate = chooseJailBustCandidate(data);
       bustImmediately = state.jailBustCandidate !== null && !state.jailBustRunning;
       if (state.settings.jailBust && !state.inJail) {
-        state.jailDueAt = Date.now() + JAIL_BUST_SCAN_MS;
+        state.jailDueAt = Date.now() + randomDelay();
       } else {
         state.jailDueAt = nextTimeFromSeconds(
           state.inJail ? Math.min(Number(data.secondsRemaining) || 3, 3) : 3,
@@ -845,8 +1057,8 @@
     else if (state.authRequired) state.currentAction = 'Log in to Underworld Legacy';
     else if (!state.controller) state.currentAction = 'Standby — another tab is active';
     else if (state.inJail) state.currentAction = 'Paused while in jail';
-    else if (autoRankIsActiveNow() && !state.jailBustRunning && !state.drugsRunning) state.currentAction = 'Auto Rank active — crimes/GTA/melt paused';
-    else if (!state.crimesRunning && !state.gtaRunning && !state.jailBustRunning && !state.meltRunning && !state.drugsRunning && !state.autoRankRunning && !state.jailRunning) state.currentAction = 'Waiting for next action';
+    else if (autoRankIsActiveNow() && !state.jailBustRunning && !state.drugsRunning && !state.playerSearchRunning) state.currentAction = 'Auto Rank active — crimes/GTA/melt paused';
+    else if (!state.crimesRunning && !state.gtaRunning && !state.jailBustRunning && !state.meltRunning && !state.drugsRunning && !state.autoRankRunning && !state.playerDiscoveryRunning && !state.playerSearchRunning && !state.jailRunning) state.currentAction = 'Waiting for next action';
     render();
   }
 
@@ -858,7 +1070,9 @@
 
     const now = Date.now();
     if (!state.jailRunning && !state.jailBustRunning && state.jailDueAt <= now) void checkJail();
-    if (state.jailRunning) return;
+    if (state.settings.discoverPlayers && !state.playerDiscoveryRunning && state.playerDiscoveryDueAt <= now) {
+      void runPlayerDiscovery();
+    }
     if (state.settings.autoRank && !state.autoRankRunning && state.autoRankDueAt <= now) {
       // Let an action already in progress finish before switching control to
       // server-side Auto Rank.
@@ -879,6 +1093,11 @@
       return;
     }
     if (state.jailBustRunning) return;
+    if (state.settings.searchPlayers && !state.playerSearchRunning && state.playerSearchDueAt <= now) {
+      void runPlayerSearch();
+      return;
+    }
+    if (state.playerSearchRunning) return;
     if (state.settings.drugs && !state.drugContextLoaded) {
       if (!state.drugsRunning && state.drugsDueAt <= now) void runDrugs();
       return;
@@ -916,6 +1135,10 @@
           <label><input type="checkbox" id="ul-simple-drugs"> Drugs</label>
           <label title="Starts a new server-side Auto Rank session after its activity timer genuinely expires"><input type="checkbox" id="ul-simple-auto-rank"> Auto-renew rank</label>
         </div>
+        <div class="ul-simple-player-controls">
+          <label title="Collect visible Players Online and public jail inmates"><input type="checkbox" id="ul-simple-discover-players"> Discover players</label>
+          <label title="Start and renew kill-page searches for collected players"><input type="checkbox" id="ul-simple-search-players"> Search players</label>
+        </div>
         <div class="ul-simple-melt-filter">
           <span>Melt:</span>
           <label><input type="checkbox" id="ul-simple-melt-common"> Common</label>
@@ -932,8 +1155,17 @@
         </div>
         <div id="ul-simple-drug-status">Drugs not checked</div>
         <div id="ul-simple-auto-rank-status">Auto Rank not checked</div>
+        <div class="ul-simple-player-list-wrap">
+          <div id="ul-simple-player-status">Player discovery disabled</div>
+          <textarea id="ul-simple-player-list" rows="4" spellcheck="false" placeholder="Player names, one per line"></textarea>
+          <div class="ul-simple-player-list-actions">
+            <button type="button" id="ul-simple-save-player-list">Save player list</button>
+            <span id="ul-simple-player-search-status">Player searching disabled</span>
+          </div>
+          <div class="ul-simple-search-warning">Kill-page searches remove death protection.</div>
+        </div>
         <div class="ul-simple-delay">
-          Other delay
+          Action / jail scan delay
           <input type="number" id="ul-simple-min-delay" min="0" max="10000" step="50" aria-label="Minimum delay">
           –
           <input type="number" id="ul-simple-max-delay" min="0" max="10000" step="50" aria-label="Maximum delay">
@@ -959,6 +1191,8 @@
       #ul-simple-bot #ul-simple-status { min-height:31px; margin-bottom:7px; color:#ffd36b; }
       #ul-simple-bot .ul-simple-controls { display:flex; flex-wrap:wrap; gap:9px; align-items:center; margin-bottom:8px; }
       #ul-simple-bot .ul-simple-controls label { display:flex; gap:4px; align-items:center; }
+      #ul-simple-bot .ul-simple-player-controls { display:flex; flex-wrap:wrap; gap:12px; align-items:center; margin-bottom:8px; padding:6px; border:1px solid #36506a; background:#111b24; }
+      #ul-simple-bot .ul-simple-player-controls label { display:flex; gap:4px; align-items:center; }
       #ul-simple-bot #ul-simple-toggle.running { color:#ffb1b1; border-color:#a44; }
       #ul-simple-bot .ul-simple-melt-filter { display:flex; gap:9px; align-items:center; margin-bottom:5px; color:#ccc; }
       #ul-simple-bot .ul-simple-melt-filter label { display:flex; gap:4px; align-items:center; }
@@ -967,6 +1201,12 @@
       #ul-simple-bot .ul-simple-drug-settings input { width:48px; padding:3px; color:#eee; background:#1b1b1b; border:1px solid #555; }
       #ul-simple-bot #ul-simple-drug-status { margin-bottom:8px; color:#9fd5ff; }
       #ul-simple-bot #ul-simple-auto-rank-status { margin-bottom:8px; color:#b8e3b8; }
+      #ul-simple-bot .ul-simple-player-list-wrap { margin-bottom:8px; padding:6px; border:1px solid #333; background:#151515; }
+      #ul-simple-bot #ul-simple-player-status { margin-bottom:5px; color:#9fd5ff; }
+      #ul-simple-bot #ul-simple-player-list { display:block; width:100%; resize:vertical; padding:4px; color:#eee; background:#0d0d0d; border:1px solid #555; font:11px/1.3 monospace; }
+      #ul-simple-bot .ul-simple-player-list-actions { display:flex; gap:7px; align-items:center; margin-top:5px; }
+      #ul-simple-bot #ul-simple-player-search-status { flex:1; color:#bbb; }
+      #ul-simple-bot .ul-simple-search-warning { margin-top:5px; color:#ffcb70; }
       #ul-simple-bot .ul-simple-delay { display:flex; gap:4px; align-items:center; color:#bbb; margin-bottom:8px; }
       #ul-simple-bot .ul-simple-delay input { width:54px; padding:3px; color:#eee; background:#1b1b1b; border:1px solid #555; }
       #ul-simple-bot #ul-simple-last { padding:6px; background:#191919; border:1px solid #333; color:#ddd; }
@@ -986,6 +1226,10 @@
     const melt = host.querySelector('#ul-simple-melt');
     const drugs = host.querySelector('#ul-simple-drugs');
     const autoRank = host.querySelector('#ul-simple-auto-rank');
+    const discoverPlayers = host.querySelector('#ul-simple-discover-players');
+    const searchPlayers = host.querySelector('#ul-simple-search-players');
+    const playerList = host.querySelector('#ul-simple-player-list');
+    const savePlayerList = host.querySelector('#ul-simple-save-player-list');
     const meltCommon = host.querySelector('#ul-simple-melt-common');
     const meltRare = host.querySelector('#ul-simple-melt-rare');
     const repairBeforeMelt = host.querySelector('#ul-simple-repair-before-melt');
@@ -1025,6 +1269,22 @@
       saveSettings({ autoRank: autoRank.checked });
       state.autoRankDueAt = 0;
       if (!autoRank.checked) state.autoRankStatus = 'Auto-renew disabled';
+    });
+    discoverPlayers.addEventListener('change', () => {
+      saveSettings({ discoverPlayers: discoverPlayers.checked });
+      state.playerDiscoveryDueAt = 0;
+      state.jailDueAt = 0;
+      state.playerDiscoveryStatus = discoverPlayers.checked
+        ? `${state.playerNames.length.toLocaleString('en-GB')} players collected`
+        : 'Player discovery disabled';
+    });
+    searchPlayers.addEventListener('change', () => {
+      saveSettings({ searchPlayers: searchPlayers.checked });
+      state.playerSearchDueAt = 0;
+      state.playerSearchStatus = searchPlayers.checked ? 'Waiting to check kill-page searches' : 'Player searching disabled';
+    });
+    savePlayerList.addEventListener('click', () => {
+      replacePlayerNames(String(playerList.value || '').split(/\r?\n|,/), 'Player list saved');
     });
     meltCommon.addEventListener('change', () => {
       saveSettings({ meltCommon: meltCommon.checked });
@@ -1067,6 +1327,8 @@
     host.querySelector('#ul-simple-melt').checked = state.settings.melt;
     host.querySelector('#ul-simple-drugs').checked = state.settings.drugs;
     host.querySelector('#ul-simple-auto-rank').checked = state.settings.autoRank;
+    host.querySelector('#ul-simple-discover-players').checked = state.settings.discoverPlayers;
+    host.querySelector('#ul-simple-search-players').checked = state.settings.searchPlayers;
     host.querySelector('#ul-simple-melt-common').checked = state.settings.meltCommon;
     host.querySelector('#ul-simple-melt-common').disabled = !state.settings.melt;
     host.querySelector('#ul-simple-melt-rare').checked = state.settings.meltRare;
@@ -1077,6 +1339,14 @@
     host.querySelector('#ul-simple-drug-repair-damage').disabled = !state.settings.drugs;
     host.querySelector('#ul-simple-drug-status').textContent = state.settings.drugs ? state.drugStatus : 'Drug run disabled';
     host.querySelector('#ul-simple-auto-rank-status').textContent = state.settings.autoRank ? state.autoRankStatus : 'Auto-renew disabled';
+    host.querySelector('#ul-simple-player-status').textContent = state.settings.discoverPlayers
+      ? state.playerDiscoveryStatus
+      : `Discovery disabled · ${state.playerNames.length.toLocaleString('en-GB')} saved`;
+    host.querySelector('#ul-simple-player-search-status').textContent = state.settings.searchPlayers
+      ? state.playerSearchStatus
+      : 'Player searching disabled';
+    const playerList = host.querySelector('#ul-simple-player-list');
+    if (document.activeElement !== playerList) playerList.value = state.playerNames.join('\n');
     host.querySelector('#ul-simple-min-delay').value = String(state.settings.minDelayMs);
     host.querySelector('#ul-simple-max-delay').value = String(state.settings.maxDelayMs);
     const tabMode = host.querySelector('#ul-simple-tab-mode');
@@ -1168,6 +1438,13 @@
   GM_addValueChangeListener(SETTINGS_KEY, (_name, _oldValue, newValue) => {
     state.settings = sanitiseSettings({ ...DEFAULT_SETTINGS, ...(newValue || {}) });
     if (state.settings.enabled) wakeAll();
+    render();
+  });
+
+  GM_addValueChangeListener(PLAYER_LIST_KEY, (_name, _oldValue, newValue) => {
+    state.playerNames = sanitisePlayerNames(newValue);
+    state.playerDiscoveryStatus = `${state.playerNames.length.toLocaleString('en-GB')} player${state.playerNames.length === 1 ? '' : 's'} collected`;
+    if (state.settings.searchPlayers) state.playerSearchDueAt = 0;
     render();
   });
 
