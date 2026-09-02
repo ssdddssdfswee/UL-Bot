@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         Underworld Legacy - Crimes, GTA, Melt & Drugs
+// @name         Underworld Legacy - Crimes & GTA
 // @namespace    https://underworldlegacy.com/
-// @version      1.4.0
-// @description  Small API-first Crimes, GTA, jailbust, safely filtered melting and optimal drug-run automation panel for Underworld Legacy.
-// @author       Crisy
+// @version      1.5.0
+// @description  Small API-first Crimes, GTA, jailbust, safely filtered melting, optimal drug runs and Auto Rank renewal for Underworld Legacy.
+// @author       Aphotic
 // @match        https://underworldlegacy.com/*
 // @match        https://www.underworldlegacy.com/*
 // @match        http://localhost:3000/*
@@ -17,7 +17,7 @@
 (() => {
   'use strict';
 
-  const SCRIPT_NAME = 'UL Crimes, GTA, Melt & Drugs';
+  const SCRIPT_NAME = 'UL Crimes, GTA, Melt, Drugs & Rank';
   const SETTINGS_KEY = 'ul_simple_crimes_gta_settings_v1';
   const CONTROLLER_LOCK = 'ul-simple-crimes-gta-controller-v1';
   const BOT_TAB_KEY = 'ul_simple_crimes_gta_bot_tab_v1';
@@ -52,6 +52,7 @@
     meltRare: false,
     repairBeforeMelt: false,
     drugs: false,
+    autoRank: false,
     drugRepairDamage: 60,
     minDelayMs: 150,
     maxDelayMs: 350,
@@ -74,17 +75,22 @@
     jailBustDueAt: 0,
     meltDueAt: 0,
     drugsDueAt: 0,
+    autoRankDueAt: 0,
     jailDueAt: 0,
     crimesRunning: false,
     gtaRunning: false,
     jailBustRunning: false,
     meltRunning: false,
     drugsRunning: false,
+    autoRankRunning: false,
     jailRunning: false,
     jailBustCandidate: null,
     drugContextLoaded: false,
     drugFavouriteCarId: null,
     drugStatus: 'Drugs not checked',
+    autoRankActive: false,
+    autoRankEndsAt: 0,
+    autoRankStatus: 'Auto Rank not checked',
     actionTail: Promise.resolve(),
     logs: [],
   };
@@ -124,6 +130,7 @@
       meltRare: value.meltRare === true,
       repairBeforeMelt: value.repairBeforeMelt === true,
       drugs: value.drugs === true,
+      autoRank: value.autoRank === true,
       drugRepairDamage: clampInteger(value.drugRepairDamage, 1, 99, DEFAULT_SETTINGS.drugRepairDamage),
       minDelayMs: Math.min(minimum, maximum),
       maxDelayMs: Math.max(minimum, maximum),
@@ -175,6 +182,7 @@
     state.jailBustDueAt = 0;
     state.meltDueAt = 0;
     state.drugsDueAt = 0;
+    state.autoRankDueAt = 0;
     state.jailDueAt = 0;
   }
 
@@ -229,7 +237,7 @@
 
   async function queueAction(path, label, options = {}) {
     if (!actionAllowed()) throw new ActionCancelledError('Automation is stopped');
-    if (state.inJail) throw new ActionCancelledError('Player is in jail');
+    if (state.inJail && options.allowInJail !== true) throw new ActionCancelledError('Player is in jail');
 
     // Delay non-crime actions before joining the mutation queue. This prevents
     // a delayed GTA/repair/melt request from holding up a newly ready crime.
@@ -241,7 +249,7 @@
       if (!actionAllowed()) {
         throw new ActionCancelledError('Automation is stopped');
       }
-      if (state.inJail) {
+      if (state.inJail && options.allowInJail !== true) {
         throw new ActionCancelledError('Player is in jail');
       }
 
@@ -596,6 +604,100 @@
     }
   }
 
+  function autoRankEndTime(data, paused = false) {
+    const absolute = Date.parse(paused ? data.sessionPausedEndsAt : data.sessionEndsAt);
+    if (Number.isFinite(absolute) && absolute > Date.now()) return absolute;
+    const seconds = Number(data.sessionSecondsRemaining);
+    return Number.isFinite(seconds) && seconds > 0 ? Date.now() + seconds * 1000 : 0;
+  }
+
+  function compactDuration(seconds) {
+    const safe = Math.max(0, Math.ceil(Number(seconds) || 0));
+    const hours = Math.floor(safe / 3600);
+    const minutes = Math.floor((safe % 3600) / 60);
+    const remainder = safe % 60;
+    if (hours > 0) return `${hours}h ${minutes}m`;
+    if (minutes > 0) return `${minutes}m ${remainder}s`;
+    return `${remainder}s`;
+  }
+
+  function applyAutoRankState(data) {
+    const tier = Number(data && data.tier) || 0;
+    if (tier < 1) {
+      state.autoRankActive = false;
+      state.autoRankEndsAt = 0;
+      state.autoRankStatus = 'Auto Rank Tier 1 is not unlocked';
+      state.autoRankDueAt = Date.now() + 5 * 60_000;
+      return 'locked';
+    }
+
+    if (data.sessionActive === true) {
+      const endsAt = autoRankEndTime(data, false);
+      const remaining = Math.max(0, Math.ceil((endsAt - Date.now()) / 1000));
+      state.autoRankActive = true;
+      state.autoRankEndsAt = endsAt;
+      state.autoRankStatus = `Active · ${compactDuration(remaining)} remaining`;
+      // Use the server-provided end time as the wake-up clock. No constant
+      // polling is needed while server-side Auto Rank is already running.
+      state.autoRankDueAt = endsAt > Date.now() ? endsAt + 100 : Date.now() + 500;
+      return 'active';
+    }
+
+    state.autoRankActive = false;
+    state.autoRankEndsAt = 0;
+    if (data.sessionPaused === true) {
+      const pausedEndsAt = autoRankEndTime(data, true);
+      const remaining = Math.max(0, Math.ceil((pausedEndsAt - Date.now()) / 1000));
+      state.autoRankStatus = `Paused · ${compactDuration(remaining)} remaining`;
+      // Respect a deliberate Stop Ranking click. Only start a new session once
+      // the paused activity itself has expired.
+      state.autoRankDueAt = pausedEndsAt > Date.now() ? pausedEndsAt + 100 : Date.now() + 500;
+      return 'paused';
+    }
+
+    state.autoRankStatus = 'Activity expired · starting ranking';
+    state.autoRankDueAt = Date.now();
+    return 'inactive';
+  }
+
+  async function runAutoRank() {
+    if (state.autoRankRunning) return;
+    state.autoRankRunning = true;
+    state.currentAction = 'Checking Auto Rank activity';
+    render();
+    try {
+      const status = await api('/api/auto-rank');
+      const sessionState = applyAutoRankState(status);
+      if (sessionState !== 'inactive') return;
+
+      const started = await queueAction('/api/auto-rank/session/start', 'Starting Auto Rank', {
+        skipDelay: true,
+        allowInJail: true,
+      });
+      applyAutoRankState(started);
+      if (started.sessionActive !== true) {
+        state.autoRankDueAt = Date.now() + 2_000;
+      }
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 400 && /already active/i.test(error.message)) {
+        state.autoRankDueAt = Date.now() + 500;
+      } else if (!(error instanceof ActionCancelledError)) {
+        handleTaskError('Auto Rank', error);
+        state.autoRankDueAt = Date.now() + errorBackoff(error);
+      }
+    } finally {
+      state.autoRankRunning = false;
+      refreshIdleStatus();
+    }
+  }
+
+  function autoRankIsActiveNow() {
+    if (!state.autoRankActive) return false;
+    if (state.autoRankEndsAt > Date.now()) return true;
+    state.autoRankActive = false;
+    return false;
+  }
+
   function jailInmateIdentifier(inmate) {
     return String((inmate && (inmate.id || inmate.username)) || '').trim();
   }
@@ -743,7 +845,8 @@
     else if (state.authRequired) state.currentAction = 'Log in to Underworld Legacy';
     else if (!state.controller) state.currentAction = 'Standby — another tab is active';
     else if (state.inJail) state.currentAction = 'Paused while in jail';
-    else if (!state.crimesRunning && !state.gtaRunning && !state.jailBustRunning && !state.meltRunning && !state.drugsRunning && !state.jailRunning) state.currentAction = 'Waiting for next action';
+    else if (autoRankIsActiveNow() && !state.jailBustRunning && !state.drugsRunning) state.currentAction = 'Auto Rank active — crimes/GTA/melt paused';
+    else if (!state.crimesRunning && !state.gtaRunning && !state.jailBustRunning && !state.meltRunning && !state.drugsRunning && !state.autoRankRunning && !state.jailRunning) state.currentAction = 'Waiting for next action';
     render();
   }
 
@@ -756,8 +859,17 @@
     const now = Date.now();
     if (!state.jailRunning && !state.jailBustRunning && state.jailDueAt <= now) void checkJail();
     if (state.jailRunning) return;
+    if (state.settings.autoRank && !state.autoRankRunning && state.autoRankDueAt <= now) {
+      // Let an action already in progress finish before switching control to
+      // server-side Auto Rank.
+      if (state.crimesRunning || state.gtaRunning || state.meltRunning || state.drugsRunning || state.jailBustRunning) return;
+      void runAutoRank();
+      return;
+    }
+    if (state.autoRankRunning) return;
     if (state.inJail) return;
-    if (state.settings.crimes && !state.crimesRunning && state.crimesDueAt <= now) {
+    const serverRanking = autoRankIsActiveNow();
+    if (!serverRanking && state.settings.crimes && !state.crimesRunning && state.crimesDueAt <= now) {
       void runCrimes();
       return;
     }
@@ -771,12 +883,18 @@
       if (!state.drugsRunning && state.drugsDueAt <= now) void runDrugs();
       return;
     }
-    if (state.settings.gta && !state.gtaRunning && state.gtaDueAt <= now) void runGta();
-    if (state.settings.melt && !state.meltRunning && state.meltDueAt <= now) void runMelt();
+    if (!serverRanking && state.settings.gta && !state.gtaRunning && state.gtaDueAt <= now) void runGta();
+    if (!serverRanking && state.settings.melt && !state.meltRunning && state.meltDueAt <= now) void runMelt();
     if (state.settings.drugs && !state.drugsRunning && state.drugsDueAt <= now) void runDrugs();
   }
 
   function createPanel() {
+    // Clear a stale panel left by a previous script copy before binding this
+    // instance. The metadata name is now permanent so future installs update
+    // this script rather than creating another Tampermonkey entry.
+    for (const existingPanel of document.querySelectorAll('#ul-simple-bot')) {
+      existingPanel.remove();
+    }
     const host = document.createElement('section');
     host.id = 'ul-simple-bot';
     host.innerHTML = `
@@ -796,6 +914,7 @@
           <label title="Failed attempts can send your character to jail"><input type="checkbox" id="ul-simple-jailbust"> Jailbust</label>
           <label><input type="checkbox" id="ul-simple-melt"> Melt</label>
           <label><input type="checkbox" id="ul-simple-drugs"> Drugs</label>
+          <label title="Starts a new server-side Auto Rank session after its activity timer genuinely expires"><input type="checkbox" id="ul-simple-auto-rank"> Auto-renew rank</label>
         </div>
         <div class="ul-simple-melt-filter">
           <span>Melt:</span>
@@ -812,6 +931,7 @@
           % damage
         </div>
         <div id="ul-simple-drug-status">Drugs not checked</div>
+        <div id="ul-simple-auto-rank-status">Auto Rank not checked</div>
         <div class="ul-simple-delay">
           Other delay
           <input type="number" id="ul-simple-min-delay" min="0" max="10000" step="50" aria-label="Minimum delay">
@@ -846,6 +966,7 @@
       #ul-simple-bot .ul-simple-drug-settings { display:flex; gap:4px; align-items:center; color:#bbb; margin-bottom:5px; }
       #ul-simple-bot .ul-simple-drug-settings input { width:48px; padding:3px; color:#eee; background:#1b1b1b; border:1px solid #555; }
       #ul-simple-bot #ul-simple-drug-status { margin-bottom:8px; color:#9fd5ff; }
+      #ul-simple-bot #ul-simple-auto-rank-status { margin-bottom:8px; color:#b8e3b8; }
       #ul-simple-bot .ul-simple-delay { display:flex; gap:4px; align-items:center; color:#bbb; margin-bottom:8px; }
       #ul-simple-bot .ul-simple-delay input { width:54px; padding:3px; color:#eee; background:#1b1b1b; border:1px solid #555; }
       #ul-simple-bot #ul-simple-last { padding:6px; background:#191919; border:1px solid #333; color:#ddd; }
@@ -864,6 +985,7 @@
     const jailBust = host.querySelector('#ul-simple-jailbust');
     const melt = host.querySelector('#ul-simple-melt');
     const drugs = host.querySelector('#ul-simple-drugs');
+    const autoRank = host.querySelector('#ul-simple-auto-rank');
     const meltCommon = host.querySelector('#ul-simple-melt-common');
     const meltRare = host.querySelector('#ul-simple-melt-rare');
     const repairBeforeMelt = host.querySelector('#ul-simple-repair-before-melt');
@@ -898,6 +1020,11 @@
       state.drugContextLoaded = false;
       state.drugFavouriteCarId = null;
       state.drugsDueAt = 0;
+    });
+    autoRank.addEventListener('change', () => {
+      saveSettings({ autoRank: autoRank.checked });
+      state.autoRankDueAt = 0;
+      if (!autoRank.checked) state.autoRankStatus = 'Auto-renew disabled';
     });
     meltCommon.addEventListener('change', () => {
       saveSettings({ meltCommon: meltCommon.checked });
@@ -939,6 +1066,7 @@
     host.querySelector('#ul-simple-jailbust').checked = state.settings.jailBust;
     host.querySelector('#ul-simple-melt').checked = state.settings.melt;
     host.querySelector('#ul-simple-drugs').checked = state.settings.drugs;
+    host.querySelector('#ul-simple-auto-rank').checked = state.settings.autoRank;
     host.querySelector('#ul-simple-melt-common').checked = state.settings.meltCommon;
     host.querySelector('#ul-simple-melt-common').disabled = !state.settings.melt;
     host.querySelector('#ul-simple-melt-rare').checked = state.settings.meltRare;
@@ -948,6 +1076,7 @@
     host.querySelector('#ul-simple-drug-repair-damage').value = String(state.settings.drugRepairDamage);
     host.querySelector('#ul-simple-drug-repair-damage').disabled = !state.settings.drugs;
     host.querySelector('#ul-simple-drug-status').textContent = state.settings.drugs ? state.drugStatus : 'Drug run disabled';
+    host.querySelector('#ul-simple-auto-rank-status').textContent = state.settings.autoRank ? state.autoRankStatus : 'Auto-renew disabled';
     host.querySelector('#ul-simple-min-delay').value = String(state.settings.minDelayMs);
     host.querySelector('#ul-simple-max-delay').value = String(state.settings.maxDelayMs);
     const tabMode = host.querySelector('#ul-simple-tab-mode');
