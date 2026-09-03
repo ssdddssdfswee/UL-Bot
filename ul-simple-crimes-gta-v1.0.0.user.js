@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Underworld Legacy - Crimes & GTA
 // @namespace    https://underworldlegacy.com/
-// @version      1.6.1
+// @version      1.7.0
 // @description  API-first crimes, GTA, jailbust, filtered melting, drug runs, Auto Rank renewal and player-search discovery for Underworld Legacy.
 // @author       Aphotic
 // @match        https://underworldlegacy.com/*
@@ -17,10 +17,11 @@
 (() => {
   'use strict';
 
-  const SCRIPT_NAME = 'UL Crimes, GTA, Melt, Drugs, Rank & Search';
+  const SCRIPT_NAME = 'Underworld Legacy Bot';
   const SETTINGS_KEY = 'ul_simple_crimes_gta_settings_v1';
   const CONTROLLER_LOCK = 'ul-simple-crimes-gta-controller-v1';
   const BOT_TAB_KEY = 'ul_simple_crimes_gta_bot_tab_v1';
+  const UI_TAB_KEY = 'ul_simple_crimes_gta_ui_tab_v1';
   const PLAYER_LIST_KEY = 'ul_simple_player_list_v1';
   const ONLINE_DISCOVERY_MS = 2 * 60_000;
   const PLAYER_SEARCH_SPACING_MS = 1_000;
@@ -66,6 +67,9 @@
   const state = {
     settings: loadSettings(),
     botTab: sessionStorage.getItem(BOT_TAB_KEY) === 'true',
+    uiTab: ['actions', 'cars', 'players', 'logs'].includes(sessionStorage.getItem(UI_TAB_KEY))
+      ? sessionStorage.getItem(UI_TAB_KEY)
+      : 'actions',
     controller: false,
     controllerLockRequested: false,
     releaseController: null,
@@ -1125,54 +1129,84 @@
         </span>
       </div>
       <div id="ul-simple-body">
-        <div id="ul-simple-status">Loading…</div>
-        <div class="ul-simple-controls">
+        <div class="ul-simple-runtime-row">
+          <div id="ul-simple-status">Loading…</div>
           <button type="button" id="ul-simple-toggle">Start</button>
-          <label><input type="checkbox" id="ul-simple-crimes"> Crimes</label>
-          <label><input type="checkbox" id="ul-simple-gta"> GTA</label>
-          <label title="Failed attempts can send your character to jail"><input type="checkbox" id="ul-simple-jailbust"> Jailbust</label>
-          <label><input type="checkbox" id="ul-simple-melt"> Melt</label>
-          <label><input type="checkbox" id="ul-simple-drugs"> Drugs</label>
-          <label title="Starts a new server-side Auto Rank session after its activity timer genuinely expires"><input type="checkbox" id="ul-simple-auto-rank"> Auto-renew rank</label>
         </div>
-        <div class="ul-simple-player-controls">
-          <label title="Collect visible Players Online and public jail inmates"><input type="checkbox" id="ul-simple-discover-players"> Discover players</label>
-          <label title="Start and renew kill-page searches for collected players"><input type="checkbox" id="ul-simple-search-players"> Search players</label>
-        </div>
-        <div class="ul-simple-melt-filter">
-          <span>Melt:</span>
-          <label><input type="checkbox" id="ul-simple-melt-common"> Common</label>
-          <label><input type="checkbox" id="ul-simple-melt-rare"> Rare</label>
-          <label><input type="checkbox" id="ul-simple-repair-before-melt"> Repair first</label>
-        </div>
-        <div class="ul-simple-protected" title="These types and every API-reported very rare car are always blocked from melting.">
-          Never melts: Tuner, RS Tuner, Mythic, Hyper, Black or Orange
-        </div>
-        <div class="ul-simple-drug-settings">
-          Drug car repair at
-          <input type="number" id="ul-simple-drug-repair-damage" min="1" max="99" step="1" aria-label="Drug car repair damage">
-          % damage
-        </div>
-        <div id="ul-simple-drug-status">Drugs not checked</div>
-        <div id="ul-simple-auto-rank-status">Auto Rank not checked</div>
-        <div class="ul-simple-player-list-wrap">
-          <div id="ul-simple-player-status">Player discovery disabled</div>
-          <textarea id="ul-simple-player-list" rows="4" spellcheck="false" placeholder="Player names, one per line"></textarea>
-          <div class="ul-simple-player-list-actions">
-            <button type="button" id="ul-simple-save-player-list">Save player list</button>
-            <span id="ul-simple-player-search-status">Player searching disabled</span>
+        <nav class="ul-simple-tabs" role="tablist" aria-label="Bot sections">
+          <button type="button" class="ul-simple-tab" data-tab="actions" role="tab">Actions</button>
+          <button type="button" class="ul-simple-tab" data-tab="cars" role="tab">Cars</button>
+          <button type="button" class="ul-simple-tab" data-tab="players" role="tab">Players</button>
+          <button type="button" class="ul-simple-tab" data-tab="logs" role="tab">Logs</button>
+        </nav>
+
+        <section class="ul-simple-tab-panel" data-tab-panel="actions" role="tabpanel">
+          <div class="ul-simple-section-title">Core actions</div>
+          <div class="ul-simple-option-grid">
+            <label><input type="checkbox" id="ul-simple-crimes"> Crimes</label>
+            <label><input type="checkbox" id="ul-simple-gta"> GTA</label>
+            <label title="Failed attempts can send your character to jail"><input type="checkbox" id="ul-simple-jailbust"> Jailbust</label>
+            <label title="Starts a new server-side Auto Rank session after its activity timer genuinely expires"><input type="checkbox" id="ul-simple-auto-rank"> Auto-renew rank</label>
           </div>
-          <div class="ul-simple-search-warning">Kill-page searches remove death protection.</div>
-        </div>
-        <div class="ul-simple-delay">
-          Action / jail scan delay
-          <input type="number" id="ul-simple-min-delay" min="0" max="10000" step="50" aria-label="Minimum delay">
-          –
-          <input type="number" id="ul-simple-max-delay" min="0" max="10000" step="50" aria-label="Maximum delay">
-          ms
-        </div>
-        <div id="ul-simple-last">None yet</div>
-        <div id="ul-simple-logs"></div>
+          <div id="ul-simple-auto-rank-status">Auto Rank not checked</div>
+        </section>
+
+        <section class="ul-simple-tab-panel" data-tab-panel="cars" role="tabpanel" hidden>
+          <div class="ul-simple-section-title">Melting</div>
+          <div class="ul-simple-option-row">
+            <label><input type="checkbox" id="ul-simple-melt"> Enable melt</label>
+          </div>
+          <div class="ul-simple-melt-filter">
+            <span>Filter:</span>
+            <label><input type="checkbox" id="ul-simple-melt-common"> Common</label>
+            <label><input type="checkbox" id="ul-simple-melt-rare"> Rare</label>
+            <label><input type="checkbox" id="ul-simple-repair-before-melt"> Repair first</label>
+          </div>
+          <div class="ul-simple-protected" title="These types and every API-reported very rare car are always blocked from melting.">
+            Never melts: Tuner, RS Tuner, Mythic, Hyper, Black or Orange
+          </div>
+          <div class="ul-simple-section-title">Drug run</div>
+          <div class="ul-simple-option-row">
+            <label><input type="checkbox" id="ul-simple-drugs"> Enable drugs</label>
+          </div>
+          <div class="ul-simple-drug-settings">
+            Repair favourite car at
+            <input type="number" id="ul-simple-drug-repair-damage" min="1" max="99" step="1" aria-label="Drug car repair damage">
+            % damage
+          </div>
+          <div id="ul-simple-drug-status">Drugs not checked</div>
+        </section>
+
+        <section class="ul-simple-tab-panel" data-tab-panel="players" role="tabpanel" hidden>
+          <div class="ul-simple-section-title">Player discovery and kill search</div>
+          <div class="ul-simple-player-controls">
+            <label title="Collect visible Players Online and public jail inmates"><input type="checkbox" id="ul-simple-discover-players"> Discover players</label>
+            <label title="Start and renew kill-page searches for collected players"><input type="checkbox" id="ul-simple-search-players"> Search players</label>
+          </div>
+          <div class="ul-simple-player-list-wrap">
+            <div id="ul-simple-player-status">Player discovery disabled</div>
+            <textarea id="ul-simple-player-list" rows="6" spellcheck="false" placeholder="Player names, one per line"></textarea>
+            <div class="ul-simple-player-list-actions">
+              <button type="button" id="ul-simple-save-player-list">Save player list</button>
+              <span id="ul-simple-player-search-status">Player searching disabled</span>
+            </div>
+            <div class="ul-simple-search-warning">Kill-page searches remove death protection.</div>
+          </div>
+        </section>
+
+        <section class="ul-simple-tab-panel" data-tab-panel="logs" role="tabpanel" hidden>
+          <div class="ul-simple-section-title">Timing</div>
+          <div class="ul-simple-delay">
+            Action / jail scan delay
+            <input type="number" id="ul-simple-min-delay" min="0" max="10000" step="50" aria-label="Minimum delay">
+            –
+            <input type="number" id="ul-simple-max-delay" min="0" max="10000" step="50" aria-label="Maximum delay">
+            ms
+          </div>
+          <div class="ul-simple-section-title">Recent activity</div>
+          <div id="ul-simple-last">None yet</div>
+          <div id="ul-simple-logs"></div>
+        </section>
       </div>
     `;
 
@@ -1187,10 +1221,19 @@
       #ul-simple-bot #ul-simple-collapse { width:24px; height:22px; padding:0; }
       #ul-simple-bot #ul-simple-tab-mode { padding:2px 6px; font-size:11px; }
       #ul-simple-bot #ul-simple-tab-mode.active { color:#a9f5a9; border-color:#4d8d4d; }
-      #ul-simple-bot #ul-simple-body { padding:8px; }
-      #ul-simple-bot #ul-simple-status { min-height:31px; margin-bottom:7px; color:#ffd36b; }
-      #ul-simple-bot .ul-simple-controls { display:flex; flex-wrap:wrap; gap:9px; align-items:center; margin-bottom:8px; }
-      #ul-simple-bot .ul-simple-controls label { display:flex; gap:4px; align-items:center; }
+      #ul-simple-bot #ul-simple-body { padding:0; }
+      #ul-simple-bot .ul-simple-runtime-row { display:grid; grid-template-columns:1fr auto; gap:8px; align-items:center; min-height:43px; padding:7px 8px; }
+      #ul-simple-bot #ul-simple-status { color:#ffd36b; }
+      #ul-simple-bot .ul-simple-tabs { display:grid; grid-template-columns:repeat(4,1fr); border-top:1px solid #3b3b3b; border-bottom:1px solid #3b3b3b; background:#181818; }
+      #ul-simple-bot .ul-simple-tab { min-width:0; padding:6px 2px; border:0; border-right:1px solid #3b3b3b; font-size:11px; }
+      #ul-simple-bot .ul-simple-tab:last-child { border-right:0; }
+      #ul-simple-bot .ul-simple-tab.active { color:#a9dcff; background:#303030; box-shadow:inset 0 -2px #69a9d2; }
+      #ul-simple-bot .ul-simple-tab-panel { min-height:150px; padding:8px; }
+      #ul-simple-bot .ul-simple-tab-panel[hidden] { display:none !important; }
+      #ul-simple-bot .ul-simple-section-title { margin:0 0 7px; padding-bottom:3px; border-bottom:1px solid #383838; color:#9fd5ff; font-weight:bold; }
+      #ul-simple-bot .ul-simple-option-grid { display:grid; grid-template-columns:1fr 1fr; gap:9px 12px; margin-bottom:12px; }
+      #ul-simple-bot .ul-simple-option-grid label, #ul-simple-bot .ul-simple-option-row label { display:flex; gap:5px; align-items:center; }
+      #ul-simple-bot .ul-simple-option-row { margin-bottom:9px; }
       #ul-simple-bot .ul-simple-player-controls { display:flex; flex-wrap:wrap; gap:12px; align-items:center; margin-bottom:8px; padding:6px; border:1px solid #36506a; background:#111b24; }
       #ul-simple-bot .ul-simple-player-controls label { display:flex; gap:4px; align-items:center; }
       #ul-simple-bot #ul-simple-toggle.running { color:#ffb1b1; border-color:#a44; }
@@ -1201,13 +1244,13 @@
       #ul-simple-bot .ul-simple-drug-settings input { width:48px; padding:3px; color:#eee; background:#1b1b1b; border:1px solid #555; }
       #ul-simple-bot #ul-simple-drug-status { margin-bottom:8px; color:#9fd5ff; }
       #ul-simple-bot #ul-simple-auto-rank-status { margin-bottom:8px; color:#b8e3b8; }
-      #ul-simple-bot .ul-simple-player-list-wrap { margin-bottom:8px; padding:6px; border:1px solid #333; background:#151515; }
+      #ul-simple-bot .ul-simple-player-list-wrap { padding:6px; border:1px solid #333; background:#151515; }
       #ul-simple-bot #ul-simple-player-status { margin-bottom:5px; color:#9fd5ff; }
       #ul-simple-bot #ul-simple-player-list { display:block; width:100%; resize:vertical; padding:4px; color:#eee; background:#0d0d0d; border:1px solid #555; font:11px/1.3 monospace; }
       #ul-simple-bot .ul-simple-player-list-actions { display:flex; gap:7px; align-items:center; margin-top:5px; }
       #ul-simple-bot #ul-simple-player-search-status { flex:1; color:#bbb; }
       #ul-simple-bot .ul-simple-search-warning { margin-top:5px; color:#ffcb70; }
-      #ul-simple-bot .ul-simple-delay { display:flex; gap:4px; align-items:center; color:#bbb; margin-bottom:8px; }
+      #ul-simple-bot .ul-simple-delay { display:flex; flex-wrap:wrap; gap:4px; align-items:center; color:#bbb; margin-bottom:12px; }
       #ul-simple-bot .ul-simple-delay input { width:54px; padding:3px; color:#eee; background:#1b1b1b; border:1px solid #555; }
       #ul-simple-bot #ul-simple-last { padding:6px; background:#191919; border:1px solid #333; color:#ddd; }
       #ul-simple-bot #ul-simple-logs { max-height:86px; overflow:auto; margin-top:5px; color:#aaa; }
@@ -1239,6 +1282,16 @@
     const tabMode = host.querySelector('#ul-simple-tab-mode');
     const collapse = host.querySelector('#ul-simple-collapse');
     const body = host.querySelector('#ul-simple-body');
+
+    for (const tab of host.querySelectorAll('.ul-simple-tab')) {
+      tab.addEventListener('click', () => {
+        const nextTab = String(tab.dataset.tab || '');
+        if (!['actions', 'cars', 'players', 'logs'].includes(nextTab)) return;
+        state.uiTab = nextTab;
+        sessionStorage.setItem(UI_TAB_KEY, nextTab);
+        render();
+      });
+    }
 
     toggle.addEventListener('click', () => saveSettings({ enabled: !state.settings.enabled }));
     crimes.addEventListener('change', () => {
@@ -1321,6 +1374,15 @@
     const toggle = host.querySelector('#ul-simple-toggle');
     toggle.textContent = state.settings.enabled ? 'Stop' : 'Start';
     toggle.classList.toggle('running', state.settings.enabled);
+    for (const tab of host.querySelectorAll('.ul-simple-tab')) {
+      const active = tab.dataset.tab === state.uiTab;
+      tab.classList.toggle('active', active);
+      tab.setAttribute('aria-selected', active ? 'true' : 'false');
+      tab.tabIndex = active ? 0 : -1;
+    }
+    for (const panel of host.querySelectorAll('.ul-simple-tab-panel')) {
+      panel.hidden = panel.dataset.tabPanel !== state.uiTab;
+    }
     host.querySelector('#ul-simple-crimes').checked = state.settings.crimes;
     host.querySelector('#ul-simple-gta').checked = state.settings.gta;
     host.querySelector('#ul-simple-jailbust').checked = state.settings.jailBust;
@@ -1352,7 +1414,7 @@
     const tabMode = host.querySelector('#ul-simple-tab-mode');
     tabMode.textContent = state.botTab ? 'Release bot tab' : 'Use as bot tab';
     tabMode.classList.toggle('active', state.botTab);
-    for (const control of host.querySelectorAll('#ul-simple-body button, #ul-simple-body input')) {
+    for (const control of host.querySelectorAll('#ul-simple-body button:not(.ul-simple-tab), #ul-simple-body input, #ul-simple-body textarea')) {
       control.disabled = !state.botTab;
     }
     if (state.botTab) {
