@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Underworld Legacy - Crimes & GTA
 // @namespace    https://underworldlegacy.com/
-// @version      1.7.0
-// @description  API-first crimes, GTA, jailbust, filtered melting, drug runs, Auto Rank renewal and player-search discovery for Underworld Legacy.
+// @version      1.8.1
+// @description  API-first UL automation with crimes, GTA, jailbust, melting, drugs, Auto Rank, player searches, Kill and Beam.
 // @author       Aphotic
 // @match        https://underworldlegacy.com/*
 // @match        https://www.underworldlegacy.com/*
@@ -23,9 +23,12 @@
   const BOT_TAB_KEY = 'ul_simple_crimes_gta_bot_tab_v1';
   const UI_TAB_KEY = 'ul_simple_crimes_gta_ui_tab_v1';
   const PLAYER_LIST_KEY = 'ul_simple_player_list_v1';
+  const PLAYER_ACTIONS_KEY = 'ul_simple_player_actions_v1';
   const ONLINE_DISCOVERY_MS = 2 * 60_000;
-  const PLAYER_SEARCH_SPACING_MS = 1_000;
-  const PLAYER_SEARCH_RENEW_SECONDS = 60;
+  const PLAYER_SEARCH_MIN_RENEW_LEAD_SECONDS = 30 * 60;
+  const PLAYER_SEARCH_RENEW_SAFETY_SECONDS = 120;
+  const SHOOT_WINDOW_MS = 10_000;
+  const SHOOT_WINDOW_LIMIT = 49;
   const DRUG_ROUTE = Object.freeze({
     russia: { buy: 'heroin', next: 'usa' },
     usa: { buy: 'lsd', next: 'south africa' },
@@ -59,6 +62,7 @@
     autoRank: false,
     discoverPlayers: false,
     searchPlayers: false,
+    beamTravelMode: 'auto',
     drugRepairDamage: 60,
     minDelayMs: 150,
     maxDelayMs: 350,
@@ -105,10 +109,15 @@
     autoRankEndsAt: 0,
     autoRankStatus: 'Auto Rank not checked',
     playerNames: loadPlayerNames(),
+    playerActions: loadPlayerActions(),
     viewerUsername: '',
     playerDiscoveryStatus: 'Player discovery disabled',
     playerSearchStatus: 'Player searching disabled',
     playerSearchBackoff: new Map(),
+    killData: null,
+    activeBodyguard: null,
+    combatStatus: 'Kill and Beam idle',
+    shootHistory: [],
     actionTail: Promise.resolve(),
     logs: [],
   };
@@ -151,6 +160,7 @@
       autoRank: value.autoRank === true,
       discoverPlayers: value.discoverPlayers === true,
       searchPlayers: value.searchPlayers === true,
+      beamTravelMode: ['auto', 'car', 'airport'].includes(value.beamTravelMode) ? value.beamTravelMode : DEFAULT_SETTINGS.beamTravelMode,
       drugRepairDamage: clampInteger(value.drugRepairDamage, 1, 99, DEFAULT_SETTINGS.drugRepairDamage),
       minDelayMs: Math.min(minimum, maximum),
       maxDelayMs: Math.max(minimum, maximum),
@@ -179,6 +189,53 @@
     return sanitisePlayerNames(GM_getValue(PLAYER_LIST_KEY, []));
   }
 
+  function sanitisePlayerActions(value) {
+    const result = {};
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return result;
+    let beamAssigned = false;
+    for (const [rawKey, rawAction] of Object.entries(value)) {
+      const key = normalisePlayerName(rawKey);
+      if (!key || !rawAction || typeof rawAction !== 'object') continue;
+      const beam = rawAction.beam === true && !beamAssigned;
+      if (beam) beamAssigned = true;
+      if (rawAction.kill === true || beam) {
+        result[key] = {
+          kill: rawAction.kill === true,
+          beam,
+          beamMode: rawAction.beamMode === 'kill' ? 'kill' : 'one',
+        };
+      }
+    }
+    return result;
+  }
+
+  function loadPlayerActions() {
+    return sanitisePlayerActions(GM_getValue(PLAYER_ACTIONS_KEY, {}));
+  }
+
+  function savePlayerActions() {
+    state.playerActions = sanitisePlayerActions(state.playerActions);
+    GM_setValue(PLAYER_ACTIONS_KEY, state.playerActions);
+    state.playerSearchDueAt = 0;
+    render();
+  }
+
+  function playerAction(name) {
+    return state.playerActions[normalisePlayerName(name)] || { kill: false, beam: false, beamMode: 'one' };
+  }
+
+  function activeBeamName() {
+    const entry = state.playerNames.find((name) => playerAction(name).beam);
+    return entry || '';
+  }
+
+  function hasCombatActions() {
+    return state.playerNames.some((name) => {
+      const action = playerAction(name);
+      return action.kill || action.beam;
+    });
+  }
+
   function setViewerUsername(value) {
     const name = validPlayerName(value);
     if (!name) return;
@@ -199,6 +256,30 @@
     state.playerDiscoveryStatus = `${state.playerNames.length.toLocaleString('en-GB')} player${state.playerNames.length === 1 ? '' : 's'} collected`;
     if (message) log(message, 'ok');
     render();
+  }
+
+  function removeNonLivingPlayer(value) {
+    const name = validPlayerName(value);
+    const key = normalisePlayerName(name);
+    if (!key) return false;
+    const before = state.playerNames.length;
+    state.playerNames = state.playerNames.filter((playerName) => normalisePlayerName(playerName) !== key);
+    delete state.playerActions[key];
+    state.playerSearchBackoff.delete(key);
+    if (state.activeBodyguard && (
+      normalisePlayerName(state.activeBodyguard.name) === key ||
+      normalisePlayerName(state.activeBodyguard.primary) === key
+    )) {
+      state.activeBodyguard = null;
+    }
+    if (state.playerNames.length === before) return false;
+    GM_setValue(PLAYER_LIST_KEY, state.playerNames);
+    GM_setValue(PLAYER_ACTIONS_KEY, state.playerActions);
+    state.playerDiscoveryStatus = `${state.playerNames.length.toLocaleString('en-GB')} player${state.playerNames.length === 1 ? '' : 's'} collected`;
+    state.playerSearchStatus = `Removed ${name}: no living player exists with that name`;
+    state.combatStatus = `Removed ${name} from the player list`;
+    log(`${name} removed from player list — game reports no living player with that exact name`, 'ok');
+    return true;
   }
 
   function addDiscoveredPlayerNames(values, source) {
@@ -823,13 +904,309 @@
       if (Number.isFinite(seconds)) waits.push(Math.max(1, seconds));
     }
     for (const found of Array.isArray(data.found) ? data.found : []) {
-      const seconds = Number(found.secondsRemaining) - PLAYER_SEARCH_RENEW_SECONDS;
+      const seconds = Number(found.secondsRemaining) - playerSearchRenewLeadSeconds(data);
       if (Number.isFinite(seconds)) waits.push(Math.max(1, seconds));
     }
     const seconds = waits.length ? Math.min(...waits) : 60;
     // Recheck at least once every five minutes so list edits or searches made
     // elsewhere are eventually reflected without continuously polling.
     return Date.now() + Math.min(5 * 60_000, seconds * 1000 + 100);
+  }
+
+  function playerSearchRenewLeadSeconds(data) {
+    const activeCount = (Array.isArray(data.found) ? data.found.length : 0) + state.playerNames.length;
+    const passSeconds = Math.ceil(activeCount * (Math.max(0, state.settings.maxDelayMs) + 120) / 1000);
+    return Math.max(PLAYER_SEARCH_MIN_RENEW_LEAD_SECONDS, passSeconds + PLAYER_SEARCH_RENEW_SAFETY_SECONDS);
+  }
+
+  function killMaps(data) {
+    return {
+      pending: new Map((Array.isArray(data.pending) ? data.pending : [])
+        .map((row) => [normalisePlayerName(row.username), row])),
+      found: new Map((Array.isArray(data.found) ? data.found : [])
+        .map((row) => [normalisePlayerName(row.username), row])),
+    };
+  }
+
+  function setActiveBodyguard(primary, bodyguard) {
+    const name = validPlayerName(bodyguard);
+    if (!name) {
+      state.activeBodyguard = null;
+      return;
+    }
+    const existing = state.activeBodyguard;
+    state.activeBodyguard = {
+      primary,
+      name,
+      confirmedAt: existing && normalisePlayerName(existing.name) === normalisePlayerName(name)
+        ? existing.confirmedAt
+        : 0,
+    };
+  }
+
+  function shootWaitMs() {
+    const now = Date.now();
+    state.shootHistory = state.shootHistory.filter((at) => at > now - SHOOT_WINDOW_MS);
+    if (state.shootHistory.length < SHOOT_WINDOW_LIMIT) return 0;
+    return Math.max(50, state.shootHistory[0] + SHOOT_WINDOW_MS - now + 25);
+  }
+
+  function nextBeamPollAt() {
+    return Date.now() + Math.max(50, randomDelay());
+  }
+
+  async function shootPlayer(username, bullets, expectedBodyguardFor = '') {
+    const wait = shootWaitMs();
+    if (wait > 0) {
+      state.playerSearchDueAt = Date.now() + wait;
+      return null;
+    }
+    state.shootHistory.push(Date.now());
+    try {
+      const result = await queueAction('/api/kill/shoot', `Shooting ${username} with ${bullets.toLocaleString('en-GB')} bullet${bullets === 1 ? '' : 's'}`, {
+        skipDelay: true,
+        body: {
+          username,
+          bullets,
+          showName: false,
+          message: '',
+          ...(expectedBodyguardFor ? { expectedBodyguardFor } : {}),
+        },
+      });
+      if (result && result.processed === true) {
+        log(`Shot at ${username} was processed, but its final response failed — refreshing before any retry`, 'warn');
+        state.playerSearchDueAt = Date.now() + 5_000;
+        return null;
+      }
+      return result;
+    } catch (error) {
+      if (error instanceof ApiError && error.body && error.body.processed === true) {
+        log(`Shot at ${username} was processed, but its final response failed — refreshing before any retry`, 'warn');
+        state.playerSearchDueAt = Date.now() + 5_000;
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  async function travelToKillTarget(row) {
+    const targetLocation = normaliseDrugLabel(row && row.location);
+    const currentLocation = normaliseDrugLabel(state.killData && state.killData.player && state.killData.player.location);
+    if (!targetLocation || targetLocation === currentLocation) return false;
+
+    const mode = state.settings.beamTravelMode;
+    let driveData = null;
+    if (mode !== 'airport') {
+      driveData = await api('/api/drugs?page=1');
+      const destination = findDrugLocation(driveData, targetLocation);
+      const favouriteCar = driveData.favouriteCar && typeof driveData.favouriteCar === 'object'
+        ? driveData.favouriteCar
+        : null;
+      if (destination && favouriteCar && driveData.driveAvailable === true) {
+        if (Number(favouriteCar.damage || 0) >= state.settings.drugRepairDamage) {
+          const publicId = Number(favouriteCar.publicId);
+          if (Number.isSafeInteger(publicId) && publicId > 0) {
+            await queueAction(`/api/gta/cars/${encodeURIComponent(String(publicId))}/repair`, `Repairing beam car ${favouriteCar.name || ''}`.trim());
+            state.playerSearchDueAt = Date.now() + 50;
+            return true;
+          }
+        }
+        await queueAction('/api/drugs/drive', `Driving to ${destination.name} for Beam`, {
+          body: { location: Number(destination.id) },
+        });
+        state.playerSearchDueAt = Date.now() + 50;
+        return true;
+      }
+      if (mode === 'car') {
+        state.combatStatus = favouriteCar
+          ? `Waiting for favourite car to reach ${row.location}`
+          : 'Beam needs a favourited car';
+        state.playerSearchDueAt = driveData ? nextDrugDriveCheck(driveData) : Date.now() + 10_000;
+        return true;
+      }
+    }
+
+    if (mode !== 'car') {
+      const airport = await api('/api/airport');
+      const destination = (Array.isArray(airport.destinations) ? airport.destinations : [])
+        .find((entry) => normaliseDrugLabel(entry && entry.name) === targetLocation);
+      if (destination && airport.available === true) {
+        await queueAction('/api/airport/fly', `Flying to ${destination.name} for Beam`, {
+          body: { location: Number(destination.id) },
+        });
+        state.playerSearchDueAt = Date.now() + 50;
+        return true;
+      }
+      const airportWait = Number(airport.secondsRemaining);
+      const driveWait = Number(driveData && driveData.driveSecondsRemaining);
+      const waits = [airportWait, driveWait].filter((seconds) => Number.isFinite(seconds) && seconds > 0);
+      state.combatStatus = `Waiting to travel to ${row.location}`;
+      state.playerSearchDueAt = Date.now() + (waits.length ? Math.min(...waits) * 1000 + 100 : 10_000);
+      return true;
+    }
+    return false;
+  }
+
+  async function searchKillName(username, label = 'Searching') {
+    try {
+      await queueAction('/api/kill/search', `${label} ${username} on the kill page`, {
+        body: { username },
+      });
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 404 && /player not found/i.test(error.message)) {
+        removeNonLivingPlayer(username);
+        state.playerSearchDueAt = Date.now() + 50;
+        return false;
+      }
+      throw error;
+    }
+    state.playerSearchBackoff.delete(normalisePlayerName(username));
+    state.playerSearchStatus = `Last searched: ${username}`;
+    state.playerSearchDueAt = Date.now() + 120;
+    return true;
+  }
+
+  async function runBeam(data, pending, found) {
+    const primary = activeBeamName();
+    if (!primary) {
+      state.activeBodyguard = null;
+      return false;
+    }
+    const primaryKey = normalisePlayerName(primary);
+    const primaryPending = pending.get(primaryKey);
+    const primaryFound = found.get(primaryKey);
+    state.combatStatus = `Beam: ${primary}`;
+
+    if (!primaryPending && !primaryFound) {
+      await searchKillName(primary, 'Starting Beam search for');
+      return true;
+    }
+    if (!primaryFound) {
+      state.combatStatus = `Beam: finding ${primary} in ${Math.max(0, Number(primaryPending.secondsUntilFound) || 0)}s`;
+      state.playerSearchDueAt = nextTimeFromSeconds(Math.min(60, Number(primaryPending.secondsUntilFound) || 60), 60);
+      return true;
+    }
+
+    const blocker = state.activeBodyguard && normalisePlayerName(state.activeBodyguard.primary) === primaryKey
+      ? state.activeBodyguard
+      : null;
+    if (blocker) {
+      const blockerKey = normalisePlayerName(blocker.name);
+      const blockerFound = found.get(blockerKey);
+      const blockerPending = pending.get(blockerKey);
+      if (!blockerFound && !blockerPending) {
+        await searchKillName(blocker.name, 'Searching bodyguard');
+        return true;
+      }
+
+      // Keep hitting the primary while its bodyguard search is pending. Once
+      // found, one more primary shot confirms the current outer bodyguard.
+      if (!blockerFound || blocker.confirmedAt === 0) {
+        if (await travelToKillTarget(primaryFound)) return true;
+        const result = await shootPlayer(primary, 1);
+        if (!result) return true;
+        if (result.blockingBodyguard) {
+          const same = normalisePlayerName(result.blockingBodyguard) === blockerKey;
+          setActiveBodyguard(primary, result.blockingBodyguard);
+          if (same && blockerFound) state.activeBodyguard.confirmedAt = Date.now();
+        } else {
+          state.activeBodyguard = null;
+          if (result.killed === true) {
+            const action = playerAction(primary);
+            state.playerActions[primaryKey] = { ...action, beam: false, kill: false };
+            savePlayerActions();
+          }
+        }
+        state.playerSearchDueAt = nextBeamPollAt();
+        return true;
+      }
+
+      if (await travelToKillTarget(blockerFound)) return true;
+      if (!data.capabilities || data.capabilities.expectedBodyguardFor !== true) {
+        state.combatStatus = 'Beam: deploy the bodyguard-safety game patch before automated bodyguard shots';
+        state.playerSearchDueAt = Date.now() + 60_000;
+        return true;
+      }
+      const prepared = await api('/api/kill/prepare', { method: 'POST', body: { username: blocker.name } });
+      const required = Number(prepared.bullets);
+      const available = Number(data.player && data.player.bullets);
+      if (!Number.isSafeInteger(required) || required < 1) throw new Error(`Invalid prepared bullet count for ${blocker.name}`);
+      if (!Number.isFinite(available) || available < required) {
+        state.combatStatus = `Beam: need ${required.toLocaleString('en-GB')} bullets for bodyguard ${blocker.name}`;
+        state.playerSearchDueAt = Date.now() + 30_000;
+        return true;
+      }
+      try {
+        const result = await shootPlayer(blocker.name, required, primary);
+        if (result && result.killed === true) {
+          log(`Bodyguard ${blocker.name} removed — returning to ${primary}`, 'ok');
+          state.activeBodyguard = null;
+        }
+      } catch (error) {
+        if (error instanceof ApiError && /bodyguard assignment changed/i.test(error.message)) {
+          state.activeBodyguard = null;
+          state.combatStatus = `Beam: ${primary}'s bodyguard changed — refreshing`;
+          log(state.combatStatus, 'warn');
+        } else {
+          throw error;
+        }
+      }
+      state.playerSearchDueAt = Date.now() + 50;
+      return true;
+    }
+
+    if (await travelToKillTarget(primaryFound)) return true;
+    const action = playerAction(primary);
+    let bullets = 1;
+    if (action.beamMode === 'kill') {
+      const prepared = await api('/api/kill/prepare', { method: 'POST', body: { username: primary } });
+      bullets = Number(prepared.bullets);
+      const available = Number(data.player && data.player.bullets);
+      if (!Number.isSafeInteger(bullets) || bullets < 1) throw new Error(`Invalid prepared bullet count for ${primary}`);
+      if (!Number.isFinite(available) || available < bullets) {
+        state.combatStatus = `Beam: need ${bullets.toLocaleString('en-GB')} bullets for ${primary}`;
+        state.playerSearchDueAt = Date.now() + 30_000;
+        return true;
+      }
+    }
+    const result = await shootPlayer(primary, bullets);
+    if (result && result.blockingBodyguard) {
+      setActiveBodyguard(primary, result.blockingBodyguard);
+      state.combatStatus = `Beam: searching bodyguard ${result.blockingBodyguard}`;
+    } else if (result && result.killed === true) {
+      state.playerActions[primaryKey] = { ...action, beam: false, kill: false };
+      savePlayerActions();
+      state.combatStatus = `Beam target ${primary} killed`;
+    }
+    state.playerSearchDueAt = nextBeamPollAt();
+    return true;
+  }
+
+  async function runPassiveKill(data, found) {
+    const target = state.playerNames.find((name) => {
+      const row = found.get(normalisePlayerName(name));
+      return playerAction(name).kill && row && row.canShootHere === true;
+    });
+    if (!target) return false;
+    const prepared = await api('/api/kill/prepare', { method: 'POST', body: { username: target } });
+    const required = Number(prepared.bullets);
+    const available = Number(data.player && data.player.bullets);
+    if (!Number.isSafeInteger(required) || required < 1) throw new Error(`Invalid prepared bullet count for ${target}`);
+    if (!Number.isFinite(available) || available < required) {
+      state.combatStatus = `Kill: need ${required.toLocaleString('en-GB')} bullets for ${target}`;
+      return false;
+    }
+    const result = await shootPlayer(target, required);
+    if (result && result.killed === true) {
+      const key = normalisePlayerName(target);
+      state.playerActions[key] = { ...playerAction(target), kill: false };
+      savePlayerActions();
+      state.combatStatus = `Kill target ${target} killed`;
+    } else if (result && result.blockingBodyguard) {
+      state.combatStatus = `Kill: ${target} is protected by ${result.blockingBodyguard}`;
+    }
+    state.playerSearchDueAt = Date.now() + 5_000;
+    return true;
   }
 
   async function runPlayerSearch() {
@@ -839,6 +1216,7 @@
     render();
     try {
       const data = await api('/api/kill');
+      state.killData = data;
       const viewer = validPlayerName(data.player && data.player.username);
       if (viewer) setViewerUsername(viewer);
       if (data.player && data.player.alive === false) {
@@ -851,25 +1229,28 @@
       for (const [key, until] of state.playerSearchBackoff) {
         if (until <= now) state.playerSearchBackoff.delete(key);
       }
-      const pending = new Map((Array.isArray(data.pending) ? data.pending : [])
-        .map((row) => [normalisePlayerName(row.username), row]));
-      const found = new Map((Array.isArray(data.found) ? data.found : [])
-        .map((row) => [normalisePlayerName(row.username), row]));
+      const { pending, found } = killMaps(data);
+      if (await runBeam(data, pending, found)) return;
+      if (await runPassiveKill(data, found)) return;
       const ownName = normalisePlayerName(state.viewerUsername);
       const candidates = state.playerNames.filter((name) => {
         const key = normalisePlayerName(name);
         return key && key !== ownName && (state.playerSearchBackoff.get(key) || 0) <= now;
       });
+      const searchCandidates = candidates.filter((name) => state.settings.searchPlayers || playerAction(name).kill || playerAction(name).beam);
 
-      // Renew an already-found player shortly before expiry before starting a
-      // new target. This preserves a completed search without renewing pending
-      // searches or resetting their find timer.
-      let target = candidates.find((name) => {
+      // Start early enough to renew the complete found list before its oldest
+      // entry expires. Renewing a pending search is unnecessary: its 3-hour
+      // find time is always well inside the 24-hour search lifetime.
+      const renewLeadSeconds = playerSearchRenewLeadSeconds(data);
+      let target = searchCandidates
+        .filter((name) => {
         const row = found.get(normalisePlayerName(name));
-        return row && Number(row.secondsRemaining) <= PLAYER_SEARCH_RENEW_SECONDS;
-      });
+          return row && Number(row.secondsRemaining) <= renewLeadSeconds;
+        })
+        .sort((left, right) => Number(found.get(normalisePlayerName(left)).secondsRemaining) - Number(found.get(normalisePlayerName(right)).secondsRemaining))[0];
       if (!target) {
-        target = candidates.find((name) => {
+        target = searchCandidates.find((name) => {
           const key = normalisePlayerName(name);
           return !pending.has(key) && !found.has(key);
         });
@@ -879,17 +1260,14 @@
         state.playerSearchStatus = state.playerNames.length
           ? `${pending.size} pending · ${found.size} found`
           : 'No players collected yet';
-        state.playerSearchDueAt = nextPlayerSearchCheck(data);
+        state.playerSearchDueAt = hasCombatActions()
+          ? Math.min(nextPlayerSearchCheck(data), Date.now() + 10_000)
+          : nextPlayerSearchCheck(data);
         return;
       }
 
       try {
-        await queueAction('/api/kill/search', `Searching ${target} on the kill page`, {
-          body: { username: target },
-        });
-        state.playerSearchBackoff.delete(normalisePlayerName(target));
-        state.playerSearchStatus = `Last searched: ${target}`;
-        state.playerSearchDueAt = Date.now() + PLAYER_SEARCH_SPACING_MS;
+        await searchKillName(target);
       } catch (error) {
         if (error instanceof ActionCancelledError) throw error;
         const message = error && error.message ? error.message : String(error);
@@ -902,7 +1280,7 @@
         );
         state.playerSearchStatus = `${target} temporarily skipped`;
         log(`Kill search ${target}: ${message}`, 'warn');
-        state.playerSearchDueAt = Date.now() + PLAYER_SEARCH_SPACING_MS;
+        state.playerSearchDueAt = Date.now() + Math.max(120, randomDelay());
       }
     } catch (error) {
       if (!(error instanceof ActionCancelledError)) handleTaskError('Player search', error);
@@ -1077,6 +1455,11 @@
     if (state.settings.discoverPlayers && !state.playerDiscoveryRunning && state.playerDiscoveryDueAt <= now) {
       void runPlayerDiscovery();
     }
+    if (!state.inJail && (state.settings.searchPlayers || hasCombatActions()) && !state.playerSearchRunning && state.playerSearchDueAt <= now) {
+      // Kill-page reads may run beside other feature reads. Any resulting POST
+      // still passes through the shared mutation queue.
+      void runPlayerSearch();
+    }
     if (state.settings.autoRank && !state.autoRankRunning && state.autoRankDueAt <= now) {
       // Let an action already in progress finish before switching control to
       // server-side Auto Rank.
@@ -1097,18 +1480,13 @@
       return;
     }
     if (state.jailBustRunning) return;
-    if (state.settings.searchPlayers && !state.playerSearchRunning && state.playerSearchDueAt <= now) {
-      void runPlayerSearch();
-      return;
-    }
-    if (state.playerSearchRunning) return;
-    if (state.settings.drugs && !state.drugContextLoaded) {
+    if (state.settings.drugs && !activeBeamName() && !state.drugContextLoaded) {
       if (!state.drugsRunning && state.drugsDueAt <= now) void runDrugs();
       return;
     }
     if (!serverRanking && state.settings.gta && !state.gtaRunning && state.gtaDueAt <= now) void runGta();
     if (!serverRanking && state.settings.melt && !state.meltRunning && state.meltDueAt <= now) void runMelt();
-    if (state.settings.drugs && !state.drugsRunning && state.drugsDueAt <= now) void runDrugs();
+    if (state.settings.drugs && !activeBeamName() && !state.drugsRunning && state.drugsDueAt <= now) void runDrugs();
   }
 
   function createPanel() {
@@ -1183,6 +1561,14 @@
             <label title="Collect visible Players Online and public jail inmates"><input type="checkbox" id="ul-simple-discover-players"> Discover players</label>
             <label title="Start and renew kill-page searches for collected players"><input type="checkbox" id="ul-simple-search-players"> Search players</label>
           </div>
+          <div class="ul-simple-beam-settings">
+            Beam travel
+            <select id="ul-simple-beam-travel" aria-label="Beam travel method">
+              <option value="auto">Auto</option>
+              <option value="car">Favourite car</option>
+              <option value="airport">Airport</option>
+            </select>
+          </div>
           <div class="ul-simple-player-list-wrap">
             <div id="ul-simple-player-status">Player discovery disabled</div>
             <textarea id="ul-simple-player-list" rows="6" spellcheck="false" placeholder="Player names, one per line"></textarea>
@@ -1192,6 +1578,9 @@
             </div>
             <div class="ul-simple-search-warning">Kill-page searches remove death protection.</div>
           </div>
+          <div id="ul-simple-combat-status">Kill and Beam idle</div>
+          <div class="ul-simple-player-actions-head"><span>Player / search</span><span>Kill</span><span>Beam</span><span>Mode</span></div>
+          <div id="ul-simple-player-actions"></div>
         </section>
 
         <section class="ul-simple-tab-panel" data-tab-panel="logs" role="tabpanel" hidden>
@@ -1236,6 +1625,8 @@
       #ul-simple-bot .ul-simple-option-row { margin-bottom:9px; }
       #ul-simple-bot .ul-simple-player-controls { display:flex; flex-wrap:wrap; gap:12px; align-items:center; margin-bottom:8px; padding:6px; border:1px solid #36506a; background:#111b24; }
       #ul-simple-bot .ul-simple-player-controls label { display:flex; gap:4px; align-items:center; }
+      #ul-simple-bot .ul-simple-beam-settings { display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; color:#bbb; }
+      #ul-simple-bot .ul-simple-beam-settings select, #ul-simple-bot .ul-simple-player-mode { color:#eee; background:#1b1b1b; border:1px solid #555; padding:2px; }
       #ul-simple-bot #ul-simple-toggle.running { color:#ffb1b1; border-color:#a44; }
       #ul-simple-bot .ul-simple-melt-filter { display:flex; gap:9px; align-items:center; margin-bottom:5px; color:#ccc; }
       #ul-simple-bot .ul-simple-melt-filter label { display:flex; gap:4px; align-items:center; }
@@ -1250,6 +1641,17 @@
       #ul-simple-bot .ul-simple-player-list-actions { display:flex; gap:7px; align-items:center; margin-top:5px; }
       #ul-simple-bot #ul-simple-player-search-status { flex:1; color:#bbb; }
       #ul-simple-bot .ul-simple-search-warning { margin-top:5px; color:#ffcb70; }
+      #ul-simple-bot #ul-simple-combat-status { margin:7px 0 4px; color:#ffb7b7; }
+      #ul-simple-bot .ul-simple-player-actions-head, #ul-simple-bot .ul-simple-player-action-row { display:grid; grid-template-columns:minmax(0,1fr) 30px 34px 54px; gap:3px; align-items:center; }
+      #ul-simple-bot .ul-simple-player-actions-head { padding:3px; color:#999; font-size:10px; text-align:center; }
+      #ul-simple-bot .ul-simple-player-actions-head span:first-child { text-align:left; }
+      #ul-simple-bot #ul-simple-player-actions { max-height:150px; overflow:auto; border:1px solid #333; }
+      #ul-simple-bot .ul-simple-player-action-row { padding:4px; border-bottom:1px solid #292929; }
+      #ul-simple-bot .ul-simple-player-action-row:last-child { border-bottom:0; }
+      #ul-simple-bot .ul-simple-player-action-name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+      #ul-simple-bot .ul-simple-player-action-name small { display:block; color:#888; }
+      #ul-simple-bot .ul-simple-player-action-row input { justify-self:center; }
+      #ul-simple-bot .ul-simple-player-mode { width:54px; font-size:10px; }
       #ul-simple-bot .ul-simple-delay { display:flex; flex-wrap:wrap; gap:4px; align-items:center; color:#bbb; margin-bottom:12px; }
       #ul-simple-bot .ul-simple-delay input { width:54px; padding:3px; color:#eee; background:#1b1b1b; border:1px solid #555; }
       #ul-simple-bot #ul-simple-last { padding:6px; background:#191919; border:1px solid #333; color:#ddd; }
@@ -1271,6 +1673,7 @@
     const autoRank = host.querySelector('#ul-simple-auto-rank');
     const discoverPlayers = host.querySelector('#ul-simple-discover-players');
     const searchPlayers = host.querySelector('#ul-simple-search-players');
+    const beamTravel = host.querySelector('#ul-simple-beam-travel');
     const playerList = host.querySelector('#ul-simple-player-list');
     const savePlayerList = host.querySelector('#ul-simple-save-player-list');
     const meltCommon = host.querySelector('#ul-simple-melt-common');
@@ -1336,8 +1739,33 @@
       state.playerSearchDueAt = 0;
       state.playerSearchStatus = searchPlayers.checked ? 'Waiting to check kill-page searches' : 'Player searching disabled';
     });
+    beamTravel.addEventListener('change', () => {
+      saveSettings({ beamTravelMode: beamTravel.value });
+      state.playerSearchDueAt = 0;
+    });
     savePlayerList.addEventListener('click', () => {
       replacePlayerNames(String(playerList.value || '').split(/\r?\n|,/), 'Player list saved');
+    });
+    host.querySelector('#ul-simple-player-actions').addEventListener('change', (event) => {
+      const control = event.target;
+      const row = control && control.closest ? control.closest('.ul-simple-player-action-row') : null;
+      const name = row && row.dataset ? row.dataset.player : '';
+      const key = normalisePlayerName(name);
+      if (!key) return;
+      const current = playerAction(name);
+      if (control.classList.contains('ul-simple-player-kill')) {
+        state.playerActions[key] = { ...current, kill: control.checked };
+      } else if (control.classList.contains('ul-simple-player-beam')) {
+        for (const [otherKey, action] of Object.entries(state.playerActions)) {
+          if (action.beam) state.playerActions[otherKey] = { ...action, beam: false };
+        }
+        state.playerActions[key] = { ...current, beam: control.checked };
+        state.activeBodyguard = null;
+        state.drugContextLoaded = false;
+      } else if (control.classList.contains('ul-simple-player-mode')) {
+        state.playerActions[key] = { ...current, beamMode: control.value === 'kill' ? 'kill' : 'one' };
+      }
+      savePlayerActions();
     });
     meltCommon.addEventListener('change', () => {
       saveSettings({ meltCommon: meltCommon.checked });
@@ -1391,6 +1819,7 @@
     host.querySelector('#ul-simple-auto-rank').checked = state.settings.autoRank;
     host.querySelector('#ul-simple-discover-players').checked = state.settings.discoverPlayers;
     host.querySelector('#ul-simple-search-players').checked = state.settings.searchPlayers;
+    host.querySelector('#ul-simple-beam-travel').value = state.settings.beamTravelMode;
     host.querySelector('#ul-simple-melt-common').checked = state.settings.meltCommon;
     host.querySelector('#ul-simple-melt-common').disabled = !state.settings.melt;
     host.querySelector('#ul-simple-melt-rare').checked = state.settings.meltRare;
@@ -1407,15 +1836,21 @@
     host.querySelector('#ul-simple-player-search-status').textContent = state.settings.searchPlayers
       ? state.playerSearchStatus
       : 'Player searching disabled';
+    host.querySelector('#ul-simple-combat-status').textContent = state.combatStatus;
     const playerList = host.querySelector('#ul-simple-player-list');
     if (document.activeElement !== playerList) playerList.value = state.playerNames.join('\n');
+    renderPlayerActions(host.querySelector('#ul-simple-player-actions'));
     host.querySelector('#ul-simple-min-delay').value = String(state.settings.minDelayMs);
     host.querySelector('#ul-simple-max-delay').value = String(state.settings.maxDelayMs);
     const tabMode = host.querySelector('#ul-simple-tab-mode');
     tabMode.textContent = state.botTab ? 'Release bot tab' : 'Use as bot tab';
     tabMode.classList.toggle('active', state.botTab);
-    for (const control of host.querySelectorAll('#ul-simple-body button:not(.ul-simple-tab), #ul-simple-body input, #ul-simple-body textarea')) {
+    for (const control of host.querySelectorAll('#ul-simple-body button:not(.ul-simple-tab), #ul-simple-body input, #ul-simple-body textarea, #ul-simple-body select')) {
       control.disabled = !state.botTab;
+    }
+    for (const mode of host.querySelectorAll('.ul-simple-player-mode')) {
+      const row = mode.closest('.ul-simple-player-action-row');
+      mode.disabled = !state.botTab || !row || !playerAction(row.dataset.player).beam;
     }
     if (state.botTab) {
       host.querySelector('#ul-simple-melt-common').disabled = !state.settings.melt;
@@ -1433,6 +1868,90 @@
       line.className = `ul-simple-log ${row.level}`;
       line.textContent = `${new Date(row.at).toLocaleTimeString('en-GB')} · ${row.text}`;
       logs.appendChild(line);
+    }
+  }
+
+  function renderPlayerActions(container) {
+    const killRows = state.killData
+      ? [...(Array.isArray(state.killData.pending) ? state.killData.pending : []), ...(Array.isArray(state.killData.found) ? state.killData.found : [])]
+      : [];
+    const signature = JSON.stringify([
+      state.botTab,
+      state.playerNames,
+      state.playerActions,
+      killRows.map((row) => [row.username, row.secondsUntilFound, row.secondsRemaining, row.location]),
+    ]);
+    if (container.dataset.renderSignature === signature) return;
+    container.dataset.renderSignature = signature;
+    const focused = document.activeElement;
+    const focusedKey = focused && focused.closest && focused.closest('.ul-simple-player-action-row')
+      ? normalisePlayerName(focused.closest('.ul-simple-player-action-row').dataset.player)
+      : '';
+    const fragment = document.createDocumentFragment();
+    const { pending, found } = killMaps(state.killData || {});
+    for (const name of state.playerNames) {
+      const key = normalisePlayerName(name);
+      const action = playerAction(name);
+      const pendingRow = pending.get(key);
+      const foundRow = found.get(key);
+      const status = foundRow
+        ? `${Math.max(0, Number(foundRow.secondsRemaining) || 0)}s · ${foundRow.location || '?'}`
+        : pendingRow
+          ? `Finding · ${Math.max(0, Number(pendingRow.secondsUntilFound) || 0)}s`
+          : 'Not searched';
+      const row = document.createElement('div');
+      row.className = 'ul-simple-player-action-row';
+      row.dataset.player = name;
+
+      const label = document.createElement('span');
+      label.className = 'ul-simple-player-action-name';
+      label.textContent = name;
+      const small = document.createElement('small');
+      small.textContent = status;
+      label.appendChild(small);
+
+      const kill = document.createElement('input');
+      kill.type = 'checkbox';
+      kill.className = 'ul-simple-player-kill';
+      kill.checked = action.kill;
+      kill.title = `Kill ${name} when found here and enough bullets are held`;
+
+      const beam = document.createElement('input');
+      beam.type = 'checkbox';
+      beam.className = 'ul-simple-player-beam';
+      beam.checked = action.beam;
+      beam.title = `Actively follow and Beam ${name}; only one Beam target can be selected`;
+
+      const mode = document.createElement('select');
+      mode.className = 'ul-simple-player-mode';
+      mode.title = 'Beam shot size';
+      for (const [value, text] of [['one', '1 bullet'], ['kill', 'Full kill']]) {
+        const option = document.createElement('option');
+        option.value = value;
+        option.textContent = text;
+        mode.appendChild(option);
+      }
+      mode.value = action.beamMode;
+      mode.disabled = !state.botTab || !action.beam;
+      row.append(label, kill, beam, mode);
+      fragment.appendChild(row);
+    }
+    if (!state.playerNames.length) {
+      const empty = document.createElement('div');
+      empty.className = 'ul-simple-player-action-row';
+      empty.textContent = 'No players saved';
+      fragment.appendChild(empty);
+    }
+    container.replaceChildren(fragment);
+    if (focusedKey) {
+      const matching = [...container.querySelectorAll('.ul-simple-player-action-row')]
+        .find((row) => normalisePlayerName(row.dataset.player) === focusedKey);
+      const selector = focused && focused.classList.contains('ul-simple-player-mode')
+        ? '.ul-simple-player-mode'
+        : focused && focused.classList.contains('ul-simple-player-beam')
+          ? '.ul-simple-player-beam'
+          : '.ul-simple-player-kill';
+      if (matching) matching.querySelector(selector)?.focus();
     }
   }
 
@@ -1507,6 +2026,12 @@
     state.playerNames = sanitisePlayerNames(newValue);
     state.playerDiscoveryStatus = `${state.playerNames.length.toLocaleString('en-GB')} player${state.playerNames.length === 1 ? '' : 's'} collected`;
     if (state.settings.searchPlayers) state.playerSearchDueAt = 0;
+    render();
+  });
+
+  GM_addValueChangeListener(PLAYER_ACTIONS_KEY, (_name, _oldValue, newValue) => {
+    state.playerActions = sanitisePlayerActions(newValue);
+    state.playerSearchDueAt = 0;
     render();
   });
 
