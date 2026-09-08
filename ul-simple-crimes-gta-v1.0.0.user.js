@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         Underworld Legacy - Crimes & GTA
 // @namespace    https://underworldlegacy.com/
-// @version      1.8.1
+// @version      1.8.2
 // @description  API-first UL automation with crimes, GTA, jailbust, melting, drugs, Auto Rank, player searches, Kill and Beam.
 // @author       Aphotic
+// @updateURL    https://raw.githubusercontent.com/ssdddssdfswee/UL-Bot/main/ul-simple-crimes-gta-v1.0.0.user.js
+// @downloadURL  https://raw.githubusercontent.com/ssdddssdfswee/UL-Bot/main/ul-simple-crimes-gta-v1.0.0.user.js
 // @match        https://underworldlegacy.com/*
 // @match        https://www.underworldlegacy.com/*
 // @match        http://localhost:3000/*
