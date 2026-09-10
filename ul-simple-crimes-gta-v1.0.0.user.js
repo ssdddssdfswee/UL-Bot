@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Underworld Legacy - Crimes & GTA
 // @namespace    https://underworldlegacy.com/
-// @version      1.8.2
+// @version      1.8.3
 // @description  API-first UL automation with crimes, GTA, jailbust, melting, drugs, Auto Rank, player searches, Kill and Beam.
 // @author       Aphotic
 // @updateURL    https://raw.githubusercontent.com/ssdddssdfswee/UL-Bot/main/ul-simple-crimes-gta-v1.0.0.user.js
@@ -916,9 +916,37 @@
   }
 
   function playerSearchRenewLeadSeconds(data) {
-    const activeCount = (Array.isArray(data.found) ? data.found.length : 0) + state.playerNames.length;
+    const activeNames = new Set(state.playerNames.map(normalisePlayerName).filter(Boolean));
+    for (const row of [...(Array.isArray(data.pending) ? data.pending : []), ...(Array.isArray(data.found) ? data.found : [])]) {
+      const key = normalisePlayerName(row && row.username);
+      if (key) activeNames.add(key);
+    }
+    if (state.activeBodyguard) {
+      const key = normalisePlayerName(state.activeBodyguard.name);
+      if (key) activeNames.add(key);
+    }
+    const activeCount = activeNames.size;
     const passSeconds = Math.ceil(activeCount * (Math.max(0, state.settings.maxDelayMs) + 120) / 1000);
     return Math.max(PLAYER_SEARCH_MIN_RENEW_LEAD_SECONDS, passSeconds + PLAYER_SEARCH_RENEW_SAFETY_SECONDS);
+  }
+
+  function nextSearchRenewalTarget(data, now) {
+    const ownKey = normalisePlayerName(state.viewerUsername);
+    const beamKey = normalisePlayerName(activeBeamName());
+    const bodyguardKey = normalisePlayerName(state.activeBodyguard && state.activeBodyguard.name);
+    const renewLeadSeconds = playerSearchRenewLeadSeconds(data);
+    return (Array.isArray(data.found) ? data.found : [])
+      .map((row) => ({ row, name: validPlayerName(row && row.username) }))
+      .filter(({ row, name }) => {
+        const key = normalisePlayerName(name);
+        const secondsRemaining = Number(row && row.secondsRemaining);
+        if (!key || key === ownKey || !Number.isFinite(secondsRemaining)) return false;
+        if ((state.playerSearchBackoff.get(key) || 0) > now) return false;
+        const action = playerAction(name);
+        const combatSearch = action.kill || action.beam || key === beamKey || key === bodyguardKey;
+        return (state.settings.searchPlayers || combatSearch) && secondsRemaining <= renewLeadSeconds;
+      })
+      .sort((left, right) => Number(left.row.secondsRemaining) - Number(right.row.secondsRemaining))[0]?.name || '';
   }
 
   function killMaps(data) {
@@ -1066,6 +1094,26 @@
     state.playerSearchStatus = `Last searched: ${username}`;
     state.playerSearchDueAt = Date.now() + 120;
     return true;
+  }
+
+  async function attemptKillSearch(username, label = 'Searching') {
+    try {
+      return await searchKillName(username, label);
+    } catch (error) {
+      if (error instanceof ActionCancelledError) throw error;
+      const message = error && error.message ? error.message : String(error);
+      const longBackoff = error instanceof ApiError && (
+        error.status === 404 || /dead|cannot be killed|protected from death|yourself/i.test(message)
+      );
+      state.playerSearchBackoff.set(
+        normalisePlayerName(username),
+        Date.now() + (longBackoff ? 6 * 60 * 60_000 : 15 * 60_000),
+      );
+      state.playerSearchStatus = `${username} temporarily skipped`;
+      log(`Kill search ${username}: ${message}`, 'warn');
+      state.playerSearchDueAt = Date.now() + Math.max(120, randomDelay());
+      return false;
+    }
   }
 
   async function runBeam(data, pending, found) {
@@ -1232,6 +1280,11 @@
         if (until <= now) state.playerSearchBackoff.delete(key);
       }
       const { pending, found } = killMaps(data);
+      const renewalTarget = nextSearchRenewalTarget(data, now);
+      if (renewalTarget) {
+        await attemptKillSearch(renewalTarget, 'Renewing search for');
+        return;
+      }
       if (await runBeam(data, pending, found)) return;
       if (await runPassiveKill(data, found)) return;
       const ownName = normalisePlayerName(state.viewerUsername);
@@ -1241,22 +1294,13 @@
       });
       const searchCandidates = candidates.filter((name) => state.settings.searchPlayers || playerAction(name).kill || playerAction(name).beam);
 
-      // Start early enough to renew the complete found list before its oldest
-      // entry expires. Renewing a pending search is unnecessary: its 3-hour
-      // find time is always well inside the 24-hour search lifetime.
-      const renewLeadSeconds = playerSearchRenewLeadSeconds(data);
-      let target = searchCandidates
-        .filter((name) => {
-        const row = found.get(normalisePlayerName(name));
-          return row && Number(row.secondsRemaining) <= renewLeadSeconds;
-        })
-        .sort((left, right) => Number(found.get(normalisePlayerName(left)).secondsRemaining) - Number(found.get(normalisePlayerName(right)).secondsRemaining))[0];
-      if (!target) {
-        target = searchCandidates.find((name) => {
-          const key = normalisePlayerName(name);
-          return !pending.has(key) && !found.has(key);
-        });
-      }
+      // Searches already returned by /api/kill are renewed above, including
+      // searches created manually on the kill page and temporary bodyguard
+      // searches which are not part of the bot's saved player list.
+      const target = searchCandidates.find((name) => {
+        const key = normalisePlayerName(name);
+        return !pending.has(key) && !found.has(key);
+      });
 
       if (!target) {
         state.playerSearchStatus = state.playerNames.length
@@ -1268,22 +1312,7 @@
         return;
       }
 
-      try {
-        await searchKillName(target);
-      } catch (error) {
-        if (error instanceof ActionCancelledError) throw error;
-        const message = error && error.message ? error.message : String(error);
-        const longBackoff = error instanceof ApiError && (
-          error.status === 404 || /dead|cannot be killed|protected from death|yourself/i.test(message)
-        );
-        state.playerSearchBackoff.set(
-          normalisePlayerName(target),
-          Date.now() + (longBackoff ? 6 * 60 * 60_000 : 15 * 60_000),
-        );
-        state.playerSearchStatus = `${target} temporarily skipped`;
-        log(`Kill search ${target}: ${message}`, 'warn');
-        state.playerSearchDueAt = Date.now() + Math.max(120, randomDelay());
-      }
+      await attemptKillSearch(target);
     } catch (error) {
       if (!(error instanceof ActionCancelledError)) handleTaskError('Player search', error);
       state.playerSearchDueAt = Date.now() + errorBackoff(error);
@@ -1561,7 +1590,7 @@
           <div class="ul-simple-section-title">Player discovery and kill search</div>
           <div class="ul-simple-player-controls">
             <label title="Collect visible Players Online and public jail inmates"><input type="checkbox" id="ul-simple-discover-players"> Discover players</label>
-            <label title="Start and renew kill-page searches for collected players"><input type="checkbox" id="ul-simple-search-players"> Search players</label>
+            <label title="Search saved players and renew every active kill-page search, including manual and bodyguard searches"><input type="checkbox" id="ul-simple-search-players"> Search players</label>
           </div>
           <div class="ul-simple-beam-settings">
             Beam travel
