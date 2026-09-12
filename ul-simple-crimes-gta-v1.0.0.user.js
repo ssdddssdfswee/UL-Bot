@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Underworld Legacy - Crimes & GTA
 // @namespace    https://underworldlegacy.com/
-// @version      1.8.3
+// @version      1.8.5
 // @description  API-first UL automation with crimes, GTA, jailbust, melting, drugs, Auto Rank, player searches, Kill and Beam.
 // @author       Aphotic
 // @updateURL    https://raw.githubusercontent.com/ssdddssdfswee/UL-Bot/main/ul-simple-crimes-gta-v1.0.0.user.js
@@ -26,6 +26,7 @@
   const UI_TAB_KEY = 'ul_simple_crimes_gta_ui_tab_v1';
   const PLAYER_LIST_KEY = 'ul_simple_player_list_v1';
   const PLAYER_ACTIONS_KEY = 'ul_simple_player_actions_v1';
+  const DEATH_STOP_KEY = 'ul_simple_death_stop_v1';
   const ONLINE_DISCOVERY_MS = 2 * 60_000;
   const PLAYER_SEARCH_MIN_RENEW_LEAD_SECONDS = 30 * 60;
   const PLAYER_SEARCH_RENEW_SAFETY_SECONDS = 120;
@@ -43,8 +44,8 @@
     ecstasy: 'russia',
     lsd: 'south africa',
   });
+  const TOGGLEABLE_TUNER_NAME = 'Tuner';
   const NEVER_MELT_CAR_NAMES = new Set([
-    'Tuner',
     'RS Tuner',
     'Mythic Car',
     'Hyper Car',
@@ -59,6 +60,7 @@
     melt: false,
     meltCommon: true,
     meltRare: false,
+    meltTuners: false,
     repairBeforeMelt: false,
     drugs: false,
     autoRank: false,
@@ -82,7 +84,7 @@
     inJail: false,
     jailMarkedAt: 0,
     authRequired: false,
-    stoppedForDeath: false,
+    stoppedForDeath: GM_getValue(DEATH_STOP_KEY, false) === true,
     currentAction: 'Waiting for controller',
     lastAction: 'None yet',
     crimesDueAt: 0,
@@ -157,6 +159,7 @@
       melt: value.melt === true,
       meltCommon: value.meltCommon !== false,
       meltRare: value.meltRare === true,
+      meltTuners: value.meltTuners === true,
       repairBeforeMelt: value.repairBeforeMelt === true,
       drugs: value.drugs === true,
       autoRank: value.autoRank === true,
@@ -308,14 +311,34 @@
   }
 
   function saveSettings(patch) {
+    const wasStoppedForDeath = state.stoppedForDeath;
     state.settings = sanitiseSettings({ ...state.settings, ...patch });
     GM_setValue(SETTINGS_KEY, state.settings);
     if (patch.enabled === true) {
-      state.stoppedForDeath = false;
-      if (state.settings.drugs) state.drugContextLoaded = false;
-      wakeAll();
+      prepareRuntimeForStart(wasStoppedForDeath);
     }
     render();
+  }
+
+  function prepareRuntimeForStart(afterDeath = false) {
+    state.stoppedForDeath = false;
+    GM_setValue(DEATH_STOP_KEY, false);
+    state.authRequired = false;
+    if (afterDeath) {
+      state.inJail = false;
+      state.jailMarkedAt = 0;
+      state.autoRankActive = false;
+      state.autoRankEndsAt = 0;
+      state.autoRankStatus = state.settings.autoRank ? 'Checking Auto Rank for this character' : 'Auto-renew disabled';
+      state.drugStatus = state.settings.drugs ? 'Checking drug run for this character' : 'Drug run disabled';
+      state.playerSearchStatus = state.settings.searchPlayers ? 'Checking searches for this character' : 'Player searching disabled';
+      state.combatStatus = 'Kill and Beam idle';
+      state.killData = null;
+      state.activeBodyguard = null;
+      state.shootHistory = [];
+    }
+    if (state.settings.drugs) state.drugContextLoaded = false;
+    wakeAll();
   }
 
   function clampInteger(value, minimum, maximum, fallback) {
@@ -363,6 +386,29 @@
     state.jailMarkedAt = Date.now();
     state.jailBustCandidate = null;
     state.jailDueAt = 0;
+  }
+
+  function stopAutomationForDeath() {
+    state.stoppedForDeath = true;
+    state.inJail = false;
+    state.authRequired = false;
+    state.settings = sanitiseSettings({ ...state.settings, enabled: false });
+    state.autoRankActive = false;
+    state.autoRankEndsAt = 0;
+    state.autoRankDueAt = 0;
+    state.autoRankStatus = state.settings.autoRank
+      ? 'Stopped after death · restart character, then press Restart bot'
+      : 'Auto-renew disabled';
+    state.drugContextLoaded = false;
+    state.drugStatus = state.settings.drugs ? 'Stopped after death' : 'Drug run disabled';
+    state.playerSearchStatus = state.settings.searchPlayers ? 'Stopped after death' : 'Player searching disabled';
+    state.combatStatus = 'Stopped after death';
+    state.killData = null;
+    state.activeBodyguard = null;
+    state.shootHistory = [];
+    GM_setValue(DEATH_STOP_KEY, true);
+    GM_setValue(SETTINGS_KEY, state.settings);
+    log('Character is dead — automation stopped; saved modules will be rechecked after Restart bot', 'error');
   }
 
   async function api(path, options = {}) {
@@ -539,6 +585,9 @@
       state.drugFavouriteCarId !== null &&
       Number(car.publicId) === state.drugFavouriteCarId
     ) return false;
+    // A standard Tuner is the sole opt-in exception to the high-value-car
+    // block. API-protected and favourite drug-run cars remain protected above.
+    if (car.name === TOGGLEABLE_TUNER_NAME) return state.settings.meltTuners;
     if (NEVER_MELT_CAR_NAMES.has(car.name) || car.rarity === 'veryRare') return false;
     if (car.rarity === 'normal') return state.settings.meltCommon;
     if (car.rarity === 'rare') return state.settings.meltRare;
@@ -798,8 +847,13 @@
     if (tier < 1) {
       state.autoRankActive = false;
       state.autoRankEndsAt = 0;
-      state.autoRankStatus = 'Auto Rank Tier 1 is not unlocked';
-      state.autoRankDueAt = Date.now() + 5 * 60_000;
+      state.autoRankStatus = 'Disabled · Auto Rank Tier 1 is not unlocked';
+      state.autoRankDueAt = 0;
+      if (state.settings.autoRank) {
+        state.settings = sanitiseSettings({ ...state.settings, autoRank: false });
+        GM_setValue(SETTINGS_KEY, state.settings);
+        log('Auto-renew rank switched off — this character does not have Auto Rank Tier 1', 'warn');
+      }
       return 'locked';
     }
 
@@ -1270,8 +1324,7 @@
       const viewer = validPlayerName(data.player && data.player.username);
       if (viewer) setViewerUsername(viewer);
       if (data.player && data.player.alive === false) {
-        state.playerSearchStatus = 'Character is dead — searches paused';
-        state.playerSearchDueAt = Date.now() + 60_000;
+        stopAutomationForDeath();
         return;
       }
 
@@ -1443,17 +1496,14 @@
 
   function handleTaskError(task, error) {
     if (error instanceof ActionCancelledError) return;
+    if (error instanceof ApiError && error.body && error.body.dead === true) {
+      stopAutomationForDeath();
+      return;
+    }
     if (error instanceof ApiError && error.status === 401) {
-      if (error.body && error.body.dead === true) {
-        state.stoppedForDeath = true;
-        state.settings.enabled = false;
-        GM_setValue(SETTINGS_KEY, state.settings);
-        log('Character is dead — automation stopped', 'error');
-      } else {
-        state.authRequired = true;
-        state.currentAction = 'Log in to Underworld Legacy';
-        render();
-      }
+      state.authRequired = true;
+      state.currentAction = 'Log in to Underworld Legacy';
+      render();
       return;
     }
     if (error instanceof ApiError && error.body && error.body.inJail === true) {
@@ -1569,10 +1619,11 @@
             <span>Filter:</span>
             <label><input type="checkbox" id="ul-simple-melt-common"> Common</label>
             <label><input type="checkbox" id="ul-simple-melt-rare"> Rare</label>
+            <label title="Allow the exact standard Tuner car to be melted; RS Tuners remain protected"><input type="checkbox" id="ul-simple-melt-tuners"> Tuners</label>
             <label><input type="checkbox" id="ul-simple-repair-before-melt"> Repair first</label>
           </div>
-          <div class="ul-simple-protected" title="These types and every API-reported very rare car are always blocked from melting.">
-            Never melts: Tuner, RS Tuner, Mythic, Hyper, Black or Orange
+          <div class="ul-simple-protected" title="These types and every other API-reported very rare car are always blocked from melting.">
+            Always protected: RS Tuner, Mythic, Hyper, Black or Orange. Standard Tuners require the toggle.
           </div>
           <div class="ul-simple-section-title">Drug run</div>
           <div class="ul-simple-option-row">
@@ -1659,7 +1710,7 @@
       #ul-simple-bot .ul-simple-beam-settings { display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; color:#bbb; }
       #ul-simple-bot .ul-simple-beam-settings select, #ul-simple-bot .ul-simple-player-mode { color:#eee; background:#1b1b1b; border:1px solid #555; padding:2px; }
       #ul-simple-bot #ul-simple-toggle.running { color:#ffb1b1; border-color:#a44; }
-      #ul-simple-bot .ul-simple-melt-filter { display:flex; gap:9px; align-items:center; margin-bottom:5px; color:#ccc; }
+      #ul-simple-bot .ul-simple-melt-filter { display:flex; flex-wrap:wrap; gap:9px; align-items:center; margin-bottom:5px; color:#ccc; }
       #ul-simple-bot .ul-simple-melt-filter label { display:flex; gap:4px; align-items:center; }
       #ul-simple-bot .ul-simple-protected { margin-bottom:8px; padding:5px 6px; border:1px solid #5b4b2c; background:#211c12; color:#ffd36b; }
       #ul-simple-bot .ul-simple-drug-settings { display:flex; gap:4px; align-items:center; color:#bbb; margin-bottom:5px; }
@@ -1709,6 +1760,7 @@
     const savePlayerList = host.querySelector('#ul-simple-save-player-list');
     const meltCommon = host.querySelector('#ul-simple-melt-common');
     const meltRare = host.querySelector('#ul-simple-melt-rare');
+    const meltTuners = host.querySelector('#ul-simple-melt-tuners');
     const repairBeforeMelt = host.querySelector('#ul-simple-repair-before-melt');
     const drugRepairDamage = host.querySelector('#ul-simple-drug-repair-damage');
     const minimum = host.querySelector('#ul-simple-min-delay');
@@ -1806,6 +1858,10 @@
       saveSettings({ meltRare: meltRare.checked });
       state.meltDueAt = 0;
     });
+    meltTuners.addEventListener('change', () => {
+      saveSettings({ meltTuners: meltTuners.checked });
+      state.meltDueAt = 0;
+    });
     repairBeforeMelt.addEventListener('change', () => {
       saveSettings({ repairBeforeMelt: repairBeforeMelt.checked });
       state.meltDueAt = 0;
@@ -1831,8 +1887,11 @@
     if (!host) return;
 
     const toggle = host.querySelector('#ul-simple-toggle');
-    toggle.textContent = state.settings.enabled ? 'Stop' : 'Start';
-    toggle.classList.toggle('running', state.settings.enabled);
+    toggle.textContent = state.stoppedForDeath ? 'Restart bot' : state.settings.enabled ? 'Stop' : 'Start';
+    toggle.title = state.stoppedForDeath
+      ? 'After restarting your character, press here to recheck and resume the saved modules'
+      : '';
+    toggle.classList.toggle('running', state.settings.enabled && !state.stoppedForDeath);
     for (const tab of host.querySelectorAll('.ul-simple-tab')) {
       const active = tab.dataset.tab === state.uiTab;
       tab.classList.toggle('active', active);
@@ -1842,25 +1901,30 @@
     for (const panel of host.querySelectorAll('.ul-simple-tab-panel')) {
       panel.hidden = panel.dataset.tabPanel !== state.uiTab;
     }
-    host.querySelector('#ul-simple-crimes').checked = state.settings.crimes;
-    host.querySelector('#ul-simple-gta').checked = state.settings.gta;
-    host.querySelector('#ul-simple-jailbust').checked = state.settings.jailBust;
-    host.querySelector('#ul-simple-melt').checked = state.settings.melt;
-    host.querySelector('#ul-simple-drugs').checked = state.settings.drugs;
-    host.querySelector('#ul-simple-auto-rank').checked = state.settings.autoRank;
-    host.querySelector('#ul-simple-discover-players').checked = state.settings.discoverPlayers;
-    host.querySelector('#ul-simple-search-players').checked = state.settings.searchPlayers;
+    const showActiveSelections = !state.stoppedForDeath;
+    host.querySelector('#ul-simple-crimes').checked = showActiveSelections && state.settings.crimes;
+    host.querySelector('#ul-simple-gta').checked = showActiveSelections && state.settings.gta;
+    host.querySelector('#ul-simple-jailbust').checked = showActiveSelections && state.settings.jailBust;
+    host.querySelector('#ul-simple-melt').checked = showActiveSelections && state.settings.melt;
+    host.querySelector('#ul-simple-drugs').checked = showActiveSelections && state.settings.drugs;
+    host.querySelector('#ul-simple-auto-rank').checked = showActiveSelections && state.settings.autoRank;
+    host.querySelector('#ul-simple-discover-players').checked = showActiveSelections && state.settings.discoverPlayers;
+    host.querySelector('#ul-simple-search-players').checked = showActiveSelections && state.settings.searchPlayers;
     host.querySelector('#ul-simple-beam-travel').value = state.settings.beamTravelMode;
     host.querySelector('#ul-simple-melt-common').checked = state.settings.meltCommon;
     host.querySelector('#ul-simple-melt-common').disabled = !state.settings.melt;
     host.querySelector('#ul-simple-melt-rare').checked = state.settings.meltRare;
     host.querySelector('#ul-simple-melt-rare').disabled = !state.settings.melt;
+    host.querySelector('#ul-simple-melt-tuners').checked = state.settings.meltTuners;
+    host.querySelector('#ul-simple-melt-tuners').disabled = !state.settings.melt;
     host.querySelector('#ul-simple-repair-before-melt').checked = state.settings.repairBeforeMelt;
     host.querySelector('#ul-simple-repair-before-melt').disabled = !state.settings.melt;
     host.querySelector('#ul-simple-drug-repair-damage').value = String(state.settings.drugRepairDamage);
     host.querySelector('#ul-simple-drug-repair-damage').disabled = !state.settings.drugs;
     host.querySelector('#ul-simple-drug-status').textContent = state.settings.drugs ? state.drugStatus : 'Drug run disabled';
-    host.querySelector('#ul-simple-auto-rank-status').textContent = state.settings.autoRank ? state.autoRankStatus : 'Auto-renew disabled';
+    host.querySelector('#ul-simple-auto-rank-status').textContent = state.settings.autoRank || /Tier 1 is not unlocked/.test(state.autoRankStatus)
+      ? state.autoRankStatus
+      : 'Auto-renew disabled';
     host.querySelector('#ul-simple-player-status').textContent = state.settings.discoverPlayers
       ? state.playerDiscoveryStatus
       : `Discovery disabled · ${state.playerNames.length.toLocaleString('en-GB')} saved`;
@@ -1879,15 +1943,28 @@
     for (const control of host.querySelectorAll('#ul-simple-body button:not(.ul-simple-tab), #ul-simple-body input, #ul-simple-body textarea, #ul-simple-body select')) {
       control.disabled = !state.botTab;
     }
+    for (const id of [
+      '#ul-simple-crimes',
+      '#ul-simple-gta',
+      '#ul-simple-jailbust',
+      '#ul-simple-melt',
+      '#ul-simple-drugs',
+      '#ul-simple-auto-rank',
+      '#ul-simple-discover-players',
+      '#ul-simple-search-players',
+    ]) {
+      host.querySelector(id).disabled = !state.botTab || state.stoppedForDeath;
+    }
     for (const mode of host.querySelectorAll('.ul-simple-player-mode')) {
       const row = mode.closest('.ul-simple-player-action-row');
-      mode.disabled = !state.botTab || !row || !playerAction(row.dataset.player).beam;
+      mode.disabled = !state.botTab || state.stoppedForDeath || !row || !playerAction(row.dataset.player).beam;
     }
     if (state.botTab) {
-      host.querySelector('#ul-simple-melt-common').disabled = !state.settings.melt;
-      host.querySelector('#ul-simple-melt-rare').disabled = !state.settings.melt;
-      host.querySelector('#ul-simple-repair-before-melt').disabled = !state.settings.melt;
-      host.querySelector('#ul-simple-drug-repair-damage').disabled = !state.settings.drugs;
+      host.querySelector('#ul-simple-melt-common').disabled = state.stoppedForDeath || !state.settings.melt;
+      host.querySelector('#ul-simple-melt-rare').disabled = state.stoppedForDeath || !state.settings.melt;
+      host.querySelector('#ul-simple-melt-tuners').disabled = state.stoppedForDeath || !state.settings.melt;
+      host.querySelector('#ul-simple-repair-before-melt').disabled = state.stoppedForDeath || !state.settings.melt;
+      host.querySelector('#ul-simple-drug-repair-damage').disabled = state.stoppedForDeath || !state.settings.drugs;
     }
     host.querySelector('#ul-simple-status').textContent = state.currentAction;
     host.querySelector('#ul-simple-last').textContent = `Last: ${state.lastAction}`;
@@ -2048,8 +2125,21 @@
   }
 
   GM_addValueChangeListener(SETTINGS_KEY, (_name, _oldValue, newValue) => {
-    state.settings = sanitiseSettings({ ...DEFAULT_SETTINGS, ...(newValue || {}) });
-    if (state.settings.enabled) wakeAll();
+    const nextSettings = sanitiseSettings({ ...DEFAULT_SETTINGS, ...(newValue || {}) });
+    const starting = nextSettings.enabled && !state.settings.enabled;
+    const wasStoppedForDeath = state.stoppedForDeath;
+    state.settings = nextSettings;
+    if (starting) prepareRuntimeForStart(wasStoppedForDeath);
+    else if (state.settings.enabled) wakeAll();
+    render();
+  });
+
+  GM_addValueChangeListener(DEATH_STOP_KEY, (_name, _oldValue, newValue) => {
+    state.stoppedForDeath = newValue === true;
+    if (state.stoppedForDeath) {
+      state.autoRankActive = false;
+      state.autoRankEndsAt = 0;
+    }
     render();
   });
 
