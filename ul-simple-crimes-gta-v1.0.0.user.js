@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Underworld Legacy - Crimes & GTA
 // @namespace    https://underworldlegacy.com/
-// @version      1.8.5
+// @version      1.8.6
 // @description  API-first UL automation with crimes, GTA, jailbust, melting, drugs, Auto Rank, player searches, Kill and Beam.
 // @author       Aphotic
 // @updateURL    https://raw.githubusercontent.com/ssdddssdfswee/UL-Bot/main/ul-simple-crimes-gta-v1.0.0.user.js
@@ -610,15 +610,35 @@
       }
 
       const groups = Array.isArray(overview.groups) ? overview.groups : [];
+      const tunerGroupAvailable = state.settings.meltTuners && groups.some(
+        (group) => group && group.name === TOGGLEABLE_TUNER_NAME && Number(group.count) > 0,
+      );
+      let car = null;
+
+      // The unfiltered melt page is paginated. Looking only at that page first
+      // can leave Tuners untouched forever while other eligible cars keep
+      // occupying it, so an enabled Tuner filter gets an explicit first lookup.
+      if (tunerGroupAvailable) {
+        const tunerPage = await api(`/api/melt?page=1&filter=${encodeURIComponent(TOGGLEABLE_TUNER_NAME)}`);
+        if (!tunerPage.available) {
+          state.meltDueAt = nextTimeFromSeconds(tunerPage.secondsRemaining, 5);
+          return;
+        }
+        car = (Array.isArray(tunerPage.cars) ? tunerPage.cars : [])
+          .find((candidate) => candidate && candidate.name === TOGGLEABLE_TUNER_NAME && canMeltCar(candidate)) || null;
+      }
+
       const eligibleGroups = groups.filter((group) => Number(group.count) > 0 && canMeltCar(group));
-      if (eligibleGroups.length === 0) {
+      if (!car && eligibleGroups.length === 0) {
         state.meltDueAt = Date.now() + 30_000;
         return;
       }
 
       const eligibleNames = new Set(eligibleGroups.map((group) => group.name));
-      let car = (Array.isArray(overview.cars) ? overview.cars : [])
-        .find((candidate) => eligibleNames.has(candidate.name) && canMeltCar(candidate));
+      if (!car) {
+        car = (Array.isArray(overview.cars) ? overview.cars : [])
+          .find((candidate) => eligibleNames.has(candidate.name) && canMeltCar(candidate)) || null;
+      }
 
       if (!car) {
         for (const eligibleGroup of eligibleGroups) {
