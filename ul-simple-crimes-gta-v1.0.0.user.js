@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Underworld Legacy - Crimes & GTA
 // @namespace    https://underworldlegacy.com/
-// @version      1.8.6
+// @version      1.8.7
 // @description  API-first UL automation with crimes, GTA, jailbust, melting, drugs, Auto Rank, player searches, Kill and Beam.
 // @author       Aphotic
 // @updateURL    https://raw.githubusercontent.com/ssdddssdfswee/UL-Bot/main/ul-simple-crimes-gta-v1.0.0.user.js
@@ -111,6 +111,10 @@
     drugStatus: 'Drugs not checked',
     autoRankActive: false,
     autoRankEndsAt: 0,
+    autoRankControls: { crimes: false, gta: false, melt: false },
+    autoRankMeltCarNames: [],
+    autoRankMeltNotice: '',
+    tunerMeltNotice: '',
     autoRankStatus: 'Auto Rank not checked',
     playerNames: loadPlayerNames(),
     playerActions: loadPlayerActions(),
@@ -329,6 +333,9 @@
       state.jailMarkedAt = 0;
       state.autoRankActive = false;
       state.autoRankEndsAt = 0;
+      state.autoRankControls = { crimes: false, gta: false, melt: false };
+      state.autoRankMeltCarNames = [];
+      state.autoRankMeltNotice = '';
       state.autoRankStatus = state.settings.autoRank ? 'Checking Auto Rank for this character' : 'Auto-renew disabled';
       state.drugStatus = state.settings.drugs ? 'Checking drug run for this character' : 'Drug run disabled';
       state.playerSearchStatus = state.settings.searchPlayers ? 'Checking searches for this character' : 'Player searching disabled';
@@ -369,6 +376,12 @@
     render();
   }
 
+  function setTunerMeltNotice(message) {
+    if (message === state.tunerMeltNotice) return;
+    state.tunerMeltNotice = message;
+    if (message) log(message, 'warn');
+  }
+
   function wakeAll() {
     state.crimesDueAt = 0;
     state.gtaDueAt = 0;
@@ -395,6 +408,9 @@
     state.settings = sanitiseSettings({ ...state.settings, enabled: false });
     state.autoRankActive = false;
     state.autoRankEndsAt = 0;
+    state.autoRankControls = { crimes: false, gta: false, melt: false };
+    state.autoRankMeltCarNames = [];
+    state.autoRankMeltNotice = '';
     state.autoRankDueAt = 0;
     state.autoRankStatus = state.settings.autoRank
       ? 'Stopped after death · restart character, then press Restart bot'
@@ -615,6 +631,12 @@
       );
       let car = null;
 
+      if (state.settings.meltTuners && !tunerGroupAvailable) {
+        setTunerMeltNotice('Tuners enabled, but the melt API reports no unprotected Tuner outside Quicktrade');
+      } else if (!state.settings.meltTuners) {
+        setTunerMeltNotice('');
+      }
+
       // The unfiltered melt page is paginated. Looking only at that page first
       // can leave Tuners untouched forever while other eligible cars keep
       // occupying it, so an enabled Tuner filter gets an explicit first lookup.
@@ -624,8 +646,20 @@
           state.meltDueAt = nextTimeFromSeconds(tunerPage.secondsRemaining, 5);
           return;
         }
-        car = (Array.isArray(tunerPage.cars) ? tunerPage.cars : [])
-          .find((candidate) => candidate && candidate.name === TOGGLEABLE_TUNER_NAME && canMeltCar(candidate)) || null;
+        const tunerCars = (Array.isArray(tunerPage.cars) ? tunerPage.cars : [])
+          .filter((candidate) => candidate && candidate.name === TOGGLEABLE_TUNER_NAME);
+        car = tunerCars.find(canMeltCar) || null;
+        if (car) {
+          setTunerMeltNotice('');
+        } else if (tunerCars.some((candidate) => (
+          state.settings.drugs &&
+          state.drugFavouriteCarId !== null &&
+          Number(candidate.publicId) === state.drugFavouriteCarId
+        ))) {
+          setTunerMeltNotice('Tuners enabled, but the available Tuner is the active drug-run favourite and remains protected');
+        } else {
+          setTunerMeltNotice('Tuners enabled, but the filtered melt API returned no safely eligible Tuner');
+        }
       }
 
       const eligibleGroups = groups.filter((group) => Number(group.count) > 0 && canMeltCar(group));
@@ -864,9 +898,21 @@
 
   function applyAutoRankState(data) {
     const tier = Number(data && data.tier) || 0;
+    const serverSettings = data && data.settings && typeof data.settings === 'object' ? data.settings : {};
+    state.autoRankControls = {
+      crimes: serverSettings.autoCrime === true,
+      gta: serverSettings.autoGta === true,
+      melt: serverSettings.autoMelt === true,
+    };
+    state.autoRankMeltCarNames = Array.isArray(serverSettings.autoMeltCarNames)
+      ? serverSettings.autoMeltCarNames.filter((name) => typeof name === 'string')
+      : [];
     if (tier < 1) {
       state.autoRankActive = false;
       state.autoRankEndsAt = 0;
+      state.autoRankControls = { crimes: false, gta: false, melt: false };
+      state.autoRankMeltCarNames = [];
+      state.autoRankMeltNotice = '';
       state.autoRankStatus = 'Disabled · Auto Rank Tier 1 is not unlocked';
       state.autoRankDueAt = 0;
       if (state.settings.autoRank) {
@@ -882,7 +928,19 @@
       const remaining = Math.max(0, Math.ceil((endsAt - Date.now()) / 1000));
       state.autoRankActive = true;
       state.autoRankEndsAt = endsAt;
-      state.autoRankStatus = `Active · ${compactDuration(remaining)} remaining`;
+      const controlled = [
+        state.autoRankControls.crimes ? 'crimes' : '',
+        state.autoRankControls.gta ? 'GTA' : '',
+        state.autoRankControls.melt ? 'melt' : '',
+      ].filter(Boolean);
+      state.autoRankStatus = `Active · ${compactDuration(remaining)} remaining${controlled.length ? ` · server: ${controlled.join(', ')}` : ' · bot actions remain local'}`;
+      const meltNotice = state.settings.melt && state.settings.meltTuners && state.autoRankControls.melt
+        ? state.autoRankMeltCarNames.includes(TOGGLEABLE_TUNER_NAME)
+          ? 'Auto Rank controls melting: only unprotected, non-favourite, non-profile Tuners selected in Auto Melt are eligible'
+          : 'Tuner melting is blocked: Auto Rank controls melting but its Auto Melt car list does not include Tuner'
+        : '';
+      if (meltNotice && meltNotice !== state.autoRankMeltNotice) log(meltNotice, 'warn');
+      state.autoRankMeltNotice = meltNotice;
       // Use the server-provided end time as the wake-up clock. No constant
       // polling is needed while server-side Auto Rank is already running.
       state.autoRankDueAt = endsAt > Date.now() ? endsAt + 100 : Date.now() + 500;
@@ -891,6 +949,7 @@
 
     state.autoRankActive = false;
     state.autoRankEndsAt = 0;
+    state.autoRankMeltNotice = '';
     if (data.sessionPaused === true) {
       const pausedEndsAt = autoRankEndTime(data, true);
       const remaining = Math.max(0, Math.ceil((pausedEndsAt - Date.now()) / 1000));
@@ -1540,7 +1599,7 @@
     else if (state.authRequired) state.currentAction = 'Log in to Underworld Legacy';
     else if (!state.controller) state.currentAction = 'Standby — another tab is active';
     else if (state.inJail) state.currentAction = 'Paused while in jail';
-    else if (autoRankIsActiveNow() && !state.jailBustRunning && !state.drugsRunning && !state.playerSearchRunning) state.currentAction = 'Auto Rank active — crimes/GTA/melt paused';
+    else if (autoRankIsActiveNow() && !state.jailBustRunning && !state.drugsRunning && !state.playerSearchRunning) state.currentAction = 'Auto Rank active — server-controlled actions paused locally';
     else if (!state.crimesRunning && !state.gtaRunning && !state.jailBustRunning && !state.meltRunning && !state.drugsRunning && !state.autoRankRunning && !state.playerDiscoveryRunning && !state.playerSearchRunning && !state.jailRunning) state.currentAction = 'Waiting for next action';
     render();
   }
@@ -1571,7 +1630,10 @@
     if (state.autoRankRunning) return;
     if (state.inJail) return;
     const serverRanking = autoRankIsActiveNow();
-    if (!serverRanking && state.settings.crimes && !state.crimesRunning && state.crimesDueAt <= now) {
+    const serverControlsCrimes = serverRanking && state.autoRankControls.crimes;
+    const serverControlsGta = serverRanking && state.autoRankControls.gta;
+    const serverControlsMelt = serverRanking && state.autoRankControls.melt;
+    if (!serverControlsCrimes && state.settings.crimes && !state.crimesRunning && state.crimesDueAt <= now) {
       void runCrimes();
       return;
     }
@@ -1585,8 +1647,8 @@
       if (!state.drugsRunning && state.drugsDueAt <= now) void runDrugs();
       return;
     }
-    if (!serverRanking && state.settings.gta && !state.gtaRunning && state.gtaDueAt <= now) void runGta();
-    if (!serverRanking && state.settings.melt && !state.meltRunning && state.meltDueAt <= now) void runMelt();
+    if (!serverControlsGta && state.settings.gta && !state.gtaRunning && state.gtaDueAt <= now) void runGta();
+    if (!serverControlsMelt && state.settings.melt && !state.meltRunning && state.meltDueAt <= now) void runMelt();
     if (state.settings.drugs && !activeBeamName() && !state.drugsRunning && state.drugsDueAt <= now) void runDrugs();
   }
 
@@ -2159,6 +2221,9 @@
     if (state.stoppedForDeath) {
       state.autoRankActive = false;
       state.autoRankEndsAt = 0;
+      state.autoRankControls = { crimes: false, gta: false, melt: false };
+      state.autoRankMeltCarNames = [];
+      state.autoRankMeltNotice = '';
     }
     render();
   });
