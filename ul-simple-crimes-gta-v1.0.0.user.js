@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Underworld Legacy - Crimes & GTA
 // @namespace    https://underworldlegacy.com/
-// @version      1.8.7
+// @version      1.9.3
 // @description  API-first UL automation with crimes, GTA, jailbust, melting, drugs, Auto Rank, player searches, Kill and Beam.
 // @author       Aphotic
 // @updateURL    https://raw.githubusercontent.com/ssdddssdfswee/UL-Bot/main/ul-simple-crimes-gta-v1.0.0.user.js
@@ -32,6 +32,12 @@
   const PLAYER_SEARCH_RENEW_SAFETY_SECONDS = 120;
   const SHOOT_WINDOW_MS = 10_000;
   const SHOOT_WINDOW_LIMIT = 49;
+  // The server refills 20 global request tokens per second with a 100-request
+  // burst. Keep a little headroom for ordinary play in another tab while still
+  // allowing the bot to use accumulated burst capacity.
+  const REQUEST_REFILL_PER_SECOND = 18;
+  const REQUEST_BURST_CAPACITY = 80;
+  const REQUEST_PRIORITY = Object.freeze({ ACTION: 0, RAPID: 1, NORMAL: 2, BACKGROUND: 3 });
   const DRUG_ROUTE = Object.freeze({
     russia: { buy: 'heroin', next: 'usa' },
     usa: { buy: 'lsd', next: 'south africa' },
@@ -68,8 +74,6 @@
     searchPlayers: false,
     beamTravelMode: 'auto',
     drugRepairDamage: 60,
-    minDelayMs: 150,
-    maxDelayMs: 350,
   });
 
   const state = {
@@ -84,6 +88,7 @@
     inJail: false,
     jailMarkedAt: 0,
     authRequired: false,
+    globalRateLimitedUntil: 0,
     stoppedForDeath: GM_getValue(DEATH_STOP_KEY, false) === true,
     currentAction: 'Waiting for controller',
     lastAction: 'None yet',
@@ -105,6 +110,7 @@
     playerDiscoveryRunning: false,
     playerSearchRunning: false,
     jailRunning: false,
+    jailMonitorRunning: false,
     jailBustCandidate: null,
     drugContextLoaded: false,
     drugFavouriteCarId: null,
@@ -123,11 +129,20 @@
     playerSearchStatus: 'Player searching disabled',
     playerSearchBackoff: new Map(),
     killData: null,
+    killDataLoadedAt: 0,
     activeBodyguard: null,
     combatStatus: 'Kill and Beam idle',
     shootHistory: [],
     actionTail: Promise.resolve(),
     logs: [],
+  };
+
+  const requestLimiter = {
+    tokens: REQUEST_BURST_CAPACITY,
+    lastRefillAt: Date.now(),
+    sequence: 0,
+    queue: [],
+    timer: null,
   };
 
   class ApiError extends Error {
@@ -153,8 +168,6 @@
   }
 
   function sanitiseSettings(value) {
-    const minimum = clampInteger(value.minDelayMs, 0, 10_000, DEFAULT_SETTINGS.minDelayMs);
-    const maximum = clampInteger(value.maxDelayMs, 0, 10_000, DEFAULT_SETTINGS.maxDelayMs);
     return {
       enabled: value.enabled === true,
       crimes: value.crimes !== false,
@@ -171,8 +184,6 @@
       searchPlayers: value.searchPlayers === true,
       beamTravelMode: ['auto', 'car', 'airport'].includes(value.beamTravelMode) ? value.beamTravelMode : DEFAULT_SETTINGS.beamTravelMode,
       drugRepairDamage: clampInteger(value.drugRepairDamage, 1, 99, DEFAULT_SETTINGS.drugRepairDamage),
-      minDelayMs: Math.min(minimum, maximum),
-      maxDelayMs: Math.max(minimum, maximum),
     };
   }
 
@@ -341,6 +352,7 @@
       state.playerSearchStatus = state.settings.searchPlayers ? 'Checking searches for this character' : 'Player searching disabled';
       state.combatStatus = 'Kill and Beam idle';
       state.killData = null;
+      state.killDataLoadedAt = 0;
       state.activeBodyguard = null;
       state.shootHistory = [];
     }
@@ -351,15 +363,6 @@
   function clampInteger(value, minimum, maximum, fallback) {
     const parsed = Number.parseInt(String(value), 10);
     return Number.isFinite(parsed) ? Math.min(maximum, Math.max(minimum, parsed)) : fallback;
-  }
-
-  function randomDelay() {
-    const { minDelayMs, maxDelayMs } = state.settings;
-    return Math.floor(Math.random() * (maxDelayMs - minDelayMs + 1)) + minDelayMs;
-  }
-
-  function sleep(milliseconds) {
-    return new Promise((resolve) => setTimeout(resolve, milliseconds));
   }
 
   function cleanMessage(value) {
@@ -420,6 +423,7 @@
     state.playerSearchStatus = state.settings.searchPlayers ? 'Stopped after death' : 'Player searching disabled';
     state.combatStatus = 'Stopped after death';
     state.killData = null;
+    state.killDataLoadedAt = 0;
     state.activeBodyguard = null;
     state.shootHistory = [];
     GM_setValue(DEATH_STOP_KEY, true);
@@ -427,13 +431,76 @@
     log('Character is dead — automation stopped; saved modules will be rechecked after Restart bot', 'error');
   }
 
+  function refillRequestTokens(now = Date.now()) {
+    const elapsed = Math.max(0, now - requestLimiter.lastRefillAt);
+    if (elapsed <= 0) return;
+    requestLimiter.tokens = Math.min(
+      REQUEST_BURST_CAPACITY,
+      requestLimiter.tokens + elapsed * REQUEST_REFILL_PER_SECOND / 1000,
+    );
+    requestLimiter.lastRefillAt = now;
+  }
+
+  function pumpRequestQueue() {
+    if (requestLimiter.timer !== null) clearTimeout(requestLimiter.timer);
+    requestLimiter.timer = null;
+    const now = Date.now();
+    if (state.globalRateLimitedUntil > now) {
+      requestLimiter.timer = setTimeout(
+        pumpRequestQueue,
+        Math.max(1, state.globalRateLimitedUntil - now),
+      );
+      return;
+    }
+    refillRequestTokens(now);
+
+    while (requestLimiter.tokens >= 1 && requestLimiter.queue.length > 0) {
+      let selectedIndex = 0;
+      for (let index = 1; index < requestLimiter.queue.length; index += 1) {
+        const selected = requestLimiter.queue[selectedIndex];
+        const candidate = requestLimiter.queue[index];
+        if (
+          candidate.priority < selected.priority ||
+          (candidate.priority === selected.priority && candidate.sequence < selected.sequence)
+        ) {
+          selectedIndex = index;
+        }
+      }
+      const [next] = requestLimiter.queue.splice(selectedIndex, 1);
+      requestLimiter.tokens -= 1;
+      next.resolve();
+    }
+
+    if (requestLimiter.queue.length > 0 && requestLimiter.timer === null) {
+      const missing = Math.max(0, 1 - requestLimiter.tokens);
+      const waitMs = Math.max(1, Math.ceil(missing * 1000 / REQUEST_REFILL_PER_SECOND));
+      requestLimiter.timer = setTimeout(pumpRequestQueue, waitMs);
+    }
+  }
+
+  function reserveRequestSlot(priority = REQUEST_PRIORITY.NORMAL) {
+    return new Promise((resolve) => {
+      requestLimiter.queue.push({
+        priority: Number.isFinite(priority) ? priority : REQUEST_PRIORITY.NORMAL,
+        sequence: requestLimiter.sequence++,
+        resolve,
+      });
+      pumpRequestQueue();
+    });
+  }
+
   async function api(path, options = {}) {
+    const method = options.method || 'GET';
+    const priority = options.priority ?? (
+      method === 'POST' ? REQUEST_PRIORITY.ACTION : REQUEST_PRIORITY.NORMAL
+    );
+    await reserveRequestSlot(priority);
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 15_000);
     let response;
     try {
       response = await fetch(new URL(path, location.origin), {
-        method: options.method || 'GET',
+        method,
         credentials: 'include',
         cache: 'no-store',
         signal: controller.signal,
@@ -459,7 +526,17 @@
 
     if (!response.ok) {
       const message = cleanMessage(body.html || body.error || body.message) || `${response.status} ${response.statusText}`;
-      throw new ApiError(response.status, message, body, clampInteger(response.headers.get('retry-after'), 0, 3600, 0));
+      const retryAfter = Math.max(
+        clampInteger(response.headers.get('retry-after'), 0, 3600, 0),
+        clampInteger(body.retryAfterSec, 0, 3600, 0),
+      );
+      if (response.status === 429 && body.pageBlocked === true && retryAfter > 0) {
+        state.globalRateLimitedUntil = Math.max(
+          state.globalRateLimitedUntil,
+          Date.now() + retryAfter * 1000 + 50,
+        );
+      }
+      throw new ApiError(response.status, message, body, retryAfter);
     }
     state.authRequired = false;
     return body;
@@ -472,12 +549,6 @@
   async function queueAction(path, label, options = {}) {
     if (!actionAllowed()) throw new ActionCancelledError('Automation is stopped');
     if (state.inJail && options.allowInJail !== true) throw new ActionCancelledError('Player is in jail');
-
-    // Delay non-crime actions before joining the mutation queue. This prevents
-    // a delayed GTA/repair/melt request from holding up a newly ready crime.
-    if (options.skipDelay !== true) {
-      await sleep(randomDelay());
-    }
 
     const execute = async () => {
       if (!actionAllowed()) {
@@ -528,7 +599,7 @@
     state.currentAction = 'Checking crimes';
     render();
     try {
-      const data = await api('/api/crimes');
+      const data = await api('/api/crimes', { priority: REQUEST_PRIORITY.ACTION });
       const crimes = Array.isArray(data.crimes) ? data.crimes : [];
       const nextTimes = [];
       let rankedUp = false;
@@ -543,8 +614,7 @@
         try {
           const result = await queueAction(
             `/api/crimes/${encodeURIComponent(crime.id)}/commit`,
-            `Committing ${crime.name}`,
-            { skipDelay: true },
+            `Committing ${crime.name}`
           );
           nextTimes.push(nextCrimeTimeFromCooldown(result.cooldownSeconds));
           rankedUp = rankedUp || result.rankedUp === true;
@@ -574,7 +644,7 @@
     state.currentAction = 'Checking GTA';
     render();
     try {
-      const data = await api('/api/gta');
+      const data = await api('/api/gta', { priority: REQUEST_PRIORITY.ACTION });
       if (data.available && !data.locked) {
         const result = await queueAction('/api/gta/steal', 'Committing GTA');
         state.gtaDueAt = nextTimeFromSeconds(result.cooldownSeconds, 5);
@@ -615,7 +685,7 @@
     state.currentAction = 'Checking cars to melt';
     render();
     try {
-      const overview = await api('/api/melt?page=1');
+      const overview = await api('/api/melt?page=1', { priority: REQUEST_PRIORITY.ACTION });
       if (overview.autoRank && overview.autoRank.committingMelt === true) {
         state.meltDueAt = Date.now() + 5_000;
         return;
@@ -641,7 +711,7 @@
       // can leave Tuners untouched forever while other eligible cars keep
       // occupying it, so an enabled Tuner filter gets an explicit first lookup.
       if (tunerGroupAvailable) {
-        const tunerPage = await api(`/api/melt?page=1&filter=${encodeURIComponent(TOGGLEABLE_TUNER_NAME)}`);
+        const tunerPage = await api(`/api/melt?page=1&filter=${encodeURIComponent(TOGGLEABLE_TUNER_NAME)}`, { priority: REQUEST_PRIORITY.ACTION });
         if (!tunerPage.available) {
           state.meltDueAt = nextTimeFromSeconds(tunerPage.secondsRemaining, 5);
           return;
@@ -676,7 +746,7 @@
 
       if (!car) {
         for (const eligibleGroup of eligibleGroups) {
-          const filtered = await api(`/api/melt?page=1&filter=${encodeURIComponent(eligibleGroup.name)}`);
+          const filtered = await api(`/api/melt?page=1&filter=${encodeURIComponent(eligibleGroup.name)}`, { priority: REQUEST_PRIORITY.ACTION });
           if (!filtered.available) {
             state.meltDueAt = nextTimeFromSeconds(filtered.secondsRemaining, 5);
             return;
@@ -756,7 +826,7 @@
     state.currentAction = 'Checking drug run';
     render();
     try {
-      const data = await api('/api/drugs?page=1');
+      const data = await api('/api/drugs?page=1', { priority: REQUEST_PRIORITY.ACTION });
       const location = normaliseDrugLabel(data.location);
       const displayLocation = String(data.location || 'Unknown');
       const capacity = Math.max(0, Number(data.capacity ?? data.rankCapacity) || 0);
@@ -971,12 +1041,11 @@
     state.currentAction = 'Checking Auto Rank activity';
     render();
     try {
-      const status = await api('/api/auto-rank');
+      const status = await api('/api/auto-rank', { priority: REQUEST_PRIORITY.ACTION });
       const sessionState = applyAutoRankState(status);
       if (sessionState !== 'inactive') return;
 
       const started = await queueAction('/api/auto-rank/session/start', 'Starting Auto Rank', {
-        skipDelay: true,
         allowInJail: true,
       });
       applyAutoRankState(started);
@@ -1009,7 +1078,7 @@
     state.currentAction = 'Checking visible online players';
     render();
     try {
-      const data = await api('/api/pages/online');
+      const data = await api('/api/pages/online', { priority: REQUEST_PRIORITY.BACKGROUND });
       setViewerUsername(data.viewerUsername);
       const visibleNames = (Array.isArray(data.players) ? data.players : [])
         .filter((player) => player && player.usernameHidden !== true)
@@ -1059,7 +1128,7 @@
       if (key) activeNames.add(key);
     }
     const activeCount = activeNames.size;
-    const passSeconds = Math.ceil(activeCount * (Math.max(0, state.settings.maxDelayMs) + 120) / 1000);
+    const passSeconds = Math.ceil(activeCount * 120 / 1000);
     return Math.max(PLAYER_SEARCH_MIN_RENEW_LEAD_SECONDS, passSeconds + PLAYER_SEARCH_RENEW_SAFETY_SECONDS);
   }
 
@@ -1115,10 +1184,12 @@
   }
 
   function nextBeamPollAt() {
-    return Date.now() + Math.max(50, randomDelay());
+    // The shared request limiter and the kill-shoot rolling window now provide
+    // all pacing. A scheduler pulse may therefore run the next Beam step.
+    return Date.now();
   }
 
-  async function shootPlayer(username, bullets, expectedBodyguardFor = '') {
+  async function shootPlayer(username, bullets) {
     const wait = shootWaitMs();
     if (wait > 0) {
       state.playerSearchDueAt = Date.now() + wait;
@@ -1127,24 +1198,32 @@
     state.shootHistory.push(Date.now());
     try {
       const result = await queueAction('/api/kill/shoot', `Shooting ${username} with ${bullets.toLocaleString('en-GB')} bullet${bullets === 1 ? '' : 's'}`, {
-        skipDelay: true,
         body: {
           username,
           bullets,
           showName: false,
           message: '',
-          ...(expectedBodyguardFor ? { expectedBodyguardFor } : {}),
         },
       });
       if (result && result.processed === true) {
         log(`Shot at ${username} was processed, but its final response failed — refreshing before any retry`, 'warn');
+        state.killData = null;
+        state.killDataLoadedAt = 0;
         state.playerSearchDueAt = Date.now() + 5_000;
         return null;
+      }
+      if (result && result.data && typeof result.data === 'object') {
+        // /api/kill/shoot already returns fresh kill-page data. Reusing it
+        // avoids wasting one GET before every Beam bullet.
+        state.killData = result.data;
+        state.killDataLoadedAt = Date.now();
       }
       return result;
     } catch (error) {
       if (error instanceof ApiError && error.body && error.body.processed === true) {
         log(`Shot at ${username} was processed, but its final response failed — refreshing before any retry`, 'warn');
+        state.killData = null;
+        state.killDataLoadedAt = 0;
         state.playerSearchDueAt = Date.now() + 5_000;
         return null;
       }
@@ -1160,7 +1239,7 @@
     const mode = state.settings.beamTravelMode;
     let driveData = null;
     if (mode !== 'airport') {
-      driveData = await api('/api/drugs?page=1');
+      driveData = await api('/api/drugs?page=1', { priority: REQUEST_PRIORITY.ACTION });
       const destination = findDrugLocation(driveData, targetLocation);
       const favouriteCar = driveData.favouriteCar && typeof driveData.favouriteCar === 'object'
         ? driveData.favouriteCar
@@ -1177,6 +1256,8 @@
         await queueAction('/api/drugs/drive', `Driving to ${destination.name} for Beam`, {
           body: { location: Number(destination.id) },
         });
+        state.killData = null;
+        state.killDataLoadedAt = 0;
         state.playerSearchDueAt = Date.now() + 50;
         return true;
       }
@@ -1190,13 +1271,15 @@
     }
 
     if (mode !== 'car') {
-      const airport = await api('/api/airport');
+      const airport = await api('/api/airport', { priority: REQUEST_PRIORITY.ACTION });
       const destination = (Array.isArray(airport.destinations) ? airport.destinations : [])
         .find((entry) => normaliseDrugLabel(entry && entry.name) === targetLocation);
       if (destination && airport.available === true) {
         await queueAction('/api/airport/fly', `Flying to ${destination.name} for Beam`, {
           body: { location: Number(destination.id) },
         });
+        state.killData = null;
+        state.killDataLoadedAt = 0;
         state.playerSearchDueAt = Date.now() + 50;
         return true;
       }
@@ -1244,7 +1327,7 @@
       );
       state.playerSearchStatus = `${username} temporarily skipped`;
       log(`Kill search ${username}: ${message}`, 'warn');
-      state.playerSearchDueAt = Date.now() + Math.max(120, randomDelay());
+      state.playerSearchDueAt = Date.now() + 120;
       return false;
     }
   }
@@ -1305,11 +1388,6 @@
       }
 
       if (await travelToKillTarget(blockerFound)) return true;
-      if (!data.capabilities || data.capabilities.expectedBodyguardFor !== true) {
-        state.combatStatus = 'Beam: deploy the bodyguard-safety game patch before automated bodyguard shots';
-        state.playerSearchDueAt = Date.now() + 60_000;
-        return true;
-      }
       const prepared = await api('/api/kill/prepare', { method: 'POST', body: { username: blocker.name } });
       const required = Number(prepared.bullets);
       const available = Number(data.player && data.player.bullets);
@@ -1320,7 +1398,7 @@
         return true;
       }
       try {
-        const result = await shootPlayer(blocker.name, required, primary);
+        const result = await shootPlayer(blocker.name, required);
         if (result && result.killed === true) {
           log(`Bodyguard ${blocker.name} removed — returning to ${primary}`, 'ok');
           state.activeBodyguard = null;
@@ -1398,8 +1476,18 @@
     state.currentAction = 'Checking kill-page searches';
     render();
     try {
-      const data = await api('/api/kill');
-      state.killData = data;
+      const canReuseBeamData = Boolean(
+        activeBeamName() &&
+        state.killData &&
+        Date.now() - state.killDataLoadedAt <= 1_500
+      );
+      const data = canReuseBeamData
+        ? state.killData
+        : await api('/api/kill', { priority: REQUEST_PRIORITY.RAPID });
+      if (!canReuseBeamData) {
+        state.killData = data;
+        state.killDataLoadedAt = Date.now();
+      }
       const viewer = validPlayerName(data.player && data.player.username);
       if (viewer) setViewerUsername(viewer);
       if (data.player && data.player.alive === false) {
@@ -1446,8 +1534,16 @@
 
       await attemptKillSearch(target);
     } catch (error) {
-      if (!(error instanceof ActionCancelledError)) handleTaskError('Player search', error);
-      state.playerSearchDueAt = Date.now() + errorBackoff(error);
+      if (error instanceof ApiError && /currently in|travel to|has not been found/i.test(error.message)) {
+        // Location/search state changed between the cached shot response and
+        // this action. Refresh immediately so Beam can travel or re-search.
+        state.killData = null;
+        state.killDataLoadedAt = 0;
+        state.playerSearchDueAt = Date.now();
+      } else {
+        if (!(error instanceof ActionCancelledError)) handleTaskError('Player search', error);
+        state.playerSearchDueAt = Date.now() + errorBackoff(error);
+      }
     } finally {
       state.playerSearchRunning = false;
       refreshIdleStatus();
@@ -1480,9 +1576,9 @@
 
   async function runJailBust() {
     const inmate = state.jailBustCandidate;
-    if (!inmate || state.jailBustRunning || state.inJail) return;
+    if (!inmate || state.jailBustRunning || state.inJail) return false;
     const inmateIdentifier = jailInmateIdentifier(inmate);
-    if (!inmateIdentifier) return;
+    if (!inmateIdentifier) return false;
 
     state.jailBustCandidate = null;
     state.jailBustRunning = true;
@@ -1491,12 +1587,12 @@
     try {
       await queueAction(
         `/api/jail/bust/${encodeURIComponent(inmateIdentifier)}`,
-        `Busting ${inmate.username || 'player'}`,
-        { skipDelay: true },
+        `Busting ${inmate.username || 'player'}`
       );
       state.jailBustCandidate = null;
-      state.jailBustDueAt = Date.now() + 50;
+      state.jailBustDueAt = Date.now();
       state.jailDueAt = 0;
+      return true;
     } catch (error) {
       if (error instanceof ApiError && (
         (error.body && error.body.success === false) ||
@@ -1507,12 +1603,13 @@
       } else if (error instanceof ApiError && error.status === 400 && /not in jail|no longer in jail/i.test(error.message)) {
         // Another player beat us to this inmate. Refresh immediately instead of
         // applying the normal error backoff, so the next inmate can be attempted.
-        state.jailBustDueAt = Date.now() + 50;
+        state.jailBustDueAt = Date.now();
       } else if (!(error instanceof ActionCancelledError)) {
         handleTaskError('Jailbust', error);
         state.jailBustDueAt = Date.now() + errorBackoff(error);
       }
       state.jailDueAt = 0;
+      return false;
     } finally {
       state.jailBustRunning = false;
       refreshIdleStatus();
@@ -1524,8 +1621,13 @@
     state.jailBustCandidate = null;
     const requestStartedAt = Date.now();
     let bustImmediately = false;
+    let checkedSuccessfully = false;
     try {
-      const data = await api('/api/jail');
+      // /api/jail is the inmate-list contract provided by the current game.
+      // Keep this bot compatible with the deployed game instead of depending
+      // on an additional bot-only endpoint.
+      const data = await api('/api/jail', { priority: REQUEST_PRIORITY.RAPID });
+      checkedSuccessfully = true;
       discoverJailInmates(data);
       const wasInJail = state.inJail;
       if (data.inJail === true) {
@@ -1535,9 +1637,14 @@
         state.jailMarkedAt = 0;
       }
       state.jailBustCandidate = chooseJailBustCandidate(data);
-      bustImmediately = state.jailBustCandidate !== null && !state.jailBustRunning;
+      bustImmediately = state.jailBustCandidate !== null
+        && !state.jailBustRunning
+        && state.jailBustDueAt <= Date.now();
       if (state.settings.jailBust && !state.inJail) {
-        state.jailDueAt = Date.now() + randomDelay();
+        // The request-driven monitor starts the next read as soon as this one
+        // and any resulting bust attempt have settled. The shared limiter still
+        // keeps action POSTs ahead of inmate scans.
+        state.jailDueAt = Date.now();
       } else {
         state.jailDueAt = nextTimeFromSeconds(
           state.inJail ? Math.min(Number(data.secondsRemaining) || 3, 3) : 3,
@@ -1558,16 +1665,51 @@
       state.jailDueAt = Date.now() + errorBackoff(error);
     } finally {
       state.jailRunning = false;
-      // Do not wait for the ordinary feature scheduler. Crimes may be processing
-      // several ready actions, and inmates can disappear within milliseconds.
-      if (bustImmediately) void runJailBust();
+      // Do not wait for the ordinary feature scheduler. The POST is chained
+      // directly from the inmate response so no page-timer pulse is required.
+      if (bustImmediately) await runJailBust();
       refreshIdleStatus();
     }
+    return checkedSuccessfully;
+  }
+
+  function jailMonitorReady() {
+    const now = Date.now();
+    return state.botTab
+      && state.controller
+      && state.settings.enabled
+      && state.settings.jailBust
+      && !state.stoppedForDeath
+      && !state.authRequired
+      && !state.inJail
+      && state.jailDueAt <= now
+      && state.jailBustDueAt <= now;
+  }
+
+  function ensureJailMonitor() {
+    if (state.jailMonitorRunning || !jailMonitorReady()) return;
+    state.jailMonitorRunning = true;
+
+    void (async () => {
+      try {
+        // Each completed /api/jail request starts the next check directly.
+        // This makes inmate discovery request-driven, so minimized-tab timer
+        // throttling cannot add a delay between a response and the next scan.
+        while (jailMonitorReady()) {
+          const checkedSuccessfully = await checkJail();
+          tick();
+          if (!checkedSuccessfully || state.inJail) break;
+        }
+      } finally {
+        state.jailMonitorRunning = false;
+        refreshIdleStatus();
+      }
+    })();
   }
 
   function errorBackoff(error) {
     if (error instanceof ApiError && error.status === 429) {
-      return Math.max(3_000, error.retryAfter * 1000);
+      return error.retryAfter > 0 ? error.retryAfter * 1000 + 50 : 250;
     }
     if (error instanceof ApiError && error.status === 401) return 10_000;
     return 5_000;
@@ -1611,7 +1753,19 @@
     }
 
     const now = Date.now();
-    if (!state.jailRunning && !state.jailBustRunning && state.jailDueAt <= now) void checkJail();
+    if (state.globalRateLimitedUntil > now) {
+      const seconds = Math.max(1, Math.ceil((state.globalRateLimitedUntil - now) / 1000));
+      const status = `Server rate limit · resuming in ${seconds}s`;
+      if (state.currentAction !== status) {
+        state.currentAction = status;
+        render();
+      }
+      return;
+    }
+    if (state.settings.jailBust && !state.inJail) ensureJailMonitor();
+    if (!state.jailMonitorRunning && !state.jailRunning && !state.jailBustRunning && state.jailDueAt <= now) {
+      void checkJail();
+    }
     if (state.settings.discoverPlayers && !state.playerDiscoveryRunning && state.playerDiscoveryDueAt <= now) {
       void runPlayerDiscovery();
     }
@@ -1650,6 +1804,17 @@
     if (!serverControlsGta && state.settings.gta && !state.gtaRunning && state.gtaDueAt <= now) void runGta();
     if (!serverControlsMelt && state.settings.melt && !state.meltRunning && state.meltDueAt <= now) void runMelt();
     if (state.settings.drugs && !activeBeamName() && !state.drugsRunning && state.drugsDueAt <= now) void runDrugs();
+  }
+
+  function startSchedulerClock() {
+    const pulse = () => {
+      tick();
+    };
+    // The current game's Content-Security-Policy deliberately blocks blob:
+    // workers. Ordinary due-time maintenance uses this lightweight clock;
+    // rapid jail monitoring is request-driven and does not wait for it.
+    pulse();
+    setInterval(pulse, 250);
   }
 
   function createPanel() {
@@ -1749,12 +1914,8 @@
 
         <section class="ul-simple-tab-panel" data-tab-panel="logs" role="tabpanel" hidden>
           <div class="ul-simple-section-title">Timing</div>
-          <div class="ul-simple-delay">
-            Action / jail scan delay
-            <input type="number" id="ul-simple-min-delay" min="0" max="10000" step="50" aria-label="Minimum delay">
-            –
-            <input type="number" id="ul-simple-max-delay" min="0" max="10000" step="50" aria-label="Maximum delay">
-            ms
+          <div class="ul-simple-pacing">
+            Automatic · Jail and Beam use all safe spare capacity; ready actions jump the queue.
           </div>
           <div class="ul-simple-section-title">Recent activity</div>
           <div id="ul-simple-last">None yet</div>
@@ -1816,8 +1977,7 @@
       #ul-simple-bot .ul-simple-player-action-name small { display:block; color:#888; }
       #ul-simple-bot .ul-simple-player-action-row input { justify-self:center; }
       #ul-simple-bot .ul-simple-player-mode { width:54px; font-size:10px; }
-      #ul-simple-bot .ul-simple-delay { display:flex; flex-wrap:wrap; gap:4px; align-items:center; color:#bbb; margin-bottom:12px; }
-      #ul-simple-bot .ul-simple-delay input { width:54px; padding:3px; color:#eee; background:#1b1b1b; border:1px solid #555; }
+      #ul-simple-bot .ul-simple-pacing { color:#bbb; margin-bottom:12px; }
       #ul-simple-bot #ul-simple-last { padding:6px; background:#191919; border:1px solid #333; color:#ddd; }
       #ul-simple-bot #ul-simple-logs { max-height:86px; overflow:auto; margin-top:5px; color:#aaa; }
       #ul-simple-bot .ul-simple-log { padding:2px 0; border-bottom:1px dotted #333; }
@@ -1845,8 +2005,6 @@
     const meltTuners = host.querySelector('#ul-simple-melt-tuners');
     const repairBeforeMelt = host.querySelector('#ul-simple-repair-before-melt');
     const drugRepairDamage = host.querySelector('#ul-simple-drug-repair-damage');
-    const minimum = host.querySelector('#ul-simple-min-delay');
-    const maximum = host.querySelector('#ul-simple-max-delay');
     const tabMode = host.querySelector('#ul-simple-tab-mode');
     const collapse = host.querySelector('#ul-simple-collapse');
     const body = host.querySelector('#ul-simple-body');
@@ -1952,8 +2110,6 @@
       saveSettings({ drugRepairDamage: drugRepairDamage.value });
       state.drugsDueAt = 0;
     });
-    minimum.addEventListener('change', () => saveSettings({ minDelayMs: minimum.value }));
-    maximum.addEventListener('change', () => saveSettings({ maxDelayMs: maximum.value }));
     tabMode.addEventListener('click', () => setBotTab(!state.botTab));
     collapse.addEventListener('click', () => {
       const hidden = body.hidden;
@@ -2017,8 +2173,6 @@
     const playerList = host.querySelector('#ul-simple-player-list');
     if (document.activeElement !== playerList) playerList.value = state.playerNames.join('\n');
     renderPlayerActions(host.querySelector('#ul-simple-player-actions'));
-    host.querySelector('#ul-simple-min-delay').value = String(state.settings.minDelayMs);
-    host.querySelector('#ul-simple-max-delay').value = String(state.settings.maxDelayMs);
     const tabMode = host.querySelector('#ul-simple-tab-mode');
     tabMode.textContent = state.botTab ? 'Release bot tab' : 'Use as bot tab';
     tabMode.classList.toggle('active', state.botTab);
@@ -2243,5 +2397,5 @@
 
   createPanel();
   if (state.botTab) startControllerElection();
-  setInterval(tick, 50);
+  startSchedulerClock();
 })();
