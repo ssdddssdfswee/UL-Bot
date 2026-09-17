@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Underworld Legacy - Crimes & GTA
 // @namespace    https://underworldlegacy.com/
-// @version      1.9.3
+// @version      1.9.6
 // @description  API-first UL automation with crimes, GTA, jailbust, melting, drugs, Auto Rank, player searches, Kill and Beam.
 // @author       Aphotic
 // @updateURL    https://raw.githubusercontent.com/ssdddssdfswee/UL-Bot/main/ul-simple-crimes-gta-v1.0.0.user.js
@@ -28,6 +28,7 @@
   const PLAYER_ACTIONS_KEY = 'ul_simple_player_actions_v1';
   const DEATH_STOP_KEY = 'ul_simple_death_stop_v1';
   const ONLINE_DISCOVERY_MS = 2 * 60_000;
+  const GANG_DISCOVERY_MS = 10 * 60_000;
   const PLAYER_SEARCH_MIN_RENEW_LEAD_SECONDS = 30 * 60;
   const PLAYER_SEARCH_RENEW_SAFETY_SECONDS = 120;
   const SHOOT_WINDOW_MS = 10_000;
@@ -99,7 +100,9 @@
     drugsDueAt: 0,
     autoRankDueAt: 0,
     playerDiscoveryDueAt: 0,
+    gangDiscoveryDueAt: 0,
     playerSearchDueAt: 0,
+    beamTravelRefreshPending: false,
     jailDueAt: 0,
     crimesRunning: false,
     gtaRunning: false,
@@ -354,6 +357,7 @@
       state.killData = null;
       state.killDataLoadedAt = 0;
       state.activeBodyguard = null;
+      state.beamTravelRefreshPending = false;
       state.shootHistory = [];
     }
     if (state.settings.drugs) state.drugContextLoaded = false;
@@ -393,6 +397,7 @@
     state.drugsDueAt = 0;
     state.autoRankDueAt = 0;
     state.playerDiscoveryDueAt = 0;
+    state.gangDiscoveryDueAt = 0;
     state.playerSearchDueAt = 0;
     state.jailDueAt = 0;
   }
@@ -425,6 +430,7 @@
     state.killData = null;
     state.killDataLoadedAt = 0;
     state.activeBodyguard = null;
+    state.beamTravelRefreshPending = false;
     state.shootHistory = [];
     GM_setValue(DEATH_STOP_KEY, true);
     GM_setValue(SETTINGS_KEY, state.settings);
@@ -496,7 +502,8 @@
     );
     await reserveRequestSlot(priority);
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15_000);
+    const timeoutMs = clampInteger(options.timeoutMs, 1_000, 130_000, 15_000);
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
     let response;
     try {
       response = await fetch(new URL(path, location.origin), {
@@ -561,7 +568,11 @@
       state.currentAction = label;
       render();
 
-      const result = await api(path, { method: 'POST', body: options.body });
+      const result = await api(path, {
+        method: 'POST',
+        body: options.body,
+        timeoutMs: options.timeoutMs,
+      });
       const message = cleanMessage(result.html) || label;
       log(message, result.success === false ? 'warn' : 'ok');
       if (result.success === false || /sent to (?:the )?jail/i.test(message)) {
@@ -616,6 +627,7 @@
             `/api/crimes/${encodeURIComponent(crime.id)}/commit`,
             `Committing ${crime.name}`
           );
+          discoverPlayerStealVictim(crime, result);
           nextTimes.push(nextCrimeTimeFromCooldown(result.cooldownSeconds));
           rankedUp = rankedUp || result.rankedUp === true;
           if (result.success === false || state.inJail) break;
@@ -1084,6 +1096,9 @@
         .filter((player) => player && player.usernameHidden !== true)
         .map((player) => player.username);
       addDiscoveredPlayerNames(visibleNames, 'Players Online');
+      if (state.gangDiscoveryDueAt <= Date.now()) {
+        await discoverGangPlayers();
+      }
       state.playerDiscoveryDueAt = Date.now() + ONLINE_DISCOVERY_MS;
     } catch (error) {
       handleTaskError('Player discovery', error);
@@ -1092,6 +1107,63 @@
       state.playerDiscoveryRunning = false;
       refreshIdleStatus();
     }
+  }
+
+  function gangProfilePlayerNames(profile) {
+    if (!profile || typeof profile !== 'object') return [];
+    return [
+      profile.boss,
+      ...(Array.isArray(profile.underboss) ? profile.underboss : []),
+      ...(Array.isArray(profile.recruiters) ? profile.recruiters : []),
+      ...(Array.isArray(profile.members) ? profile.members : []),
+    ];
+  }
+
+  async function discoverGangPlayers() {
+    state.currentAction = 'Scanning living gang members';
+    render();
+    const directory = await api('/api/gangs', { priority: REQUEST_PRIORITY.BACKGROUND });
+    const gangs = (Array.isArray(directory.gangs) ? directory.gangs : [])
+      .map((gang) => ({ legacyId: Number(gang && gang.legacyId) }))
+      .filter((gang) => Number.isSafeInteger(gang.legacyId) && gang.legacyId > 0);
+    const names = [];
+    let scanned = 0;
+
+    for (const gang of gangs) {
+      if (!state.settings.discoverPlayers || !actionAllowed()) break;
+      try {
+        const profile = await api(`/api/gangs/gang/${encodeURIComponent(String(gang.legacyId))}`, {
+          priority: REQUEST_PRIORITY.BACKGROUND,
+        });
+        names.push(...gangProfilePlayerNames(profile));
+        scanned += 1;
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 404) continue;
+        throw error;
+      }
+    }
+
+    addDiscoveredPlayerNames(names, `${scanned} living gang roster${scanned === 1 ? '' : 's'}`);
+    state.gangDiscoveryDueAt = Date.now() + GANG_DISCOVERY_MS;
+  }
+
+  function discoverPlayerStealVictim(crime, result) {
+    if (
+      !state.settings.discoverPlayers ||
+      !crime ||
+      crime.slug !== 'steal' ||
+      !result ||
+      result.success !== true
+    ) return false;
+
+    const match = String(result.html || '').match(/\bfrom\s+<b>([^<]+)<\/b>/i);
+    if (!match) return false;
+    const decoded = document.createElement('div');
+    decoded.innerHTML = match[1];
+    const username = validPlayerName(decoded.textContent);
+    if (!username) return false;
+    addDiscoveredPlayerNames([username], 'Steal from a player');
+    return true;
   }
 
   function discoverJailInmates(data) {
@@ -1192,12 +1264,17 @@
   async function shootPlayer(username, bullets) {
     const wait = shootWaitMs();
     if (wait > 0) {
+      state.combatStatus = `Shoot limit: ${username} in ${Math.max(1, Math.ceil(wait / 1000))}s`;
       state.playerSearchDueAt = Date.now() + wait;
       return null;
     }
     state.shootHistory.push(Date.now());
     try {
       const result = await queueAction('/api/kill/shoot', `Shooting ${username} with ${bullets.toLocaleString('en-GB')} bullet${bullets === 1 ? '' : 's'}`, {
+        // The current shoot transaction is allowed to wait for life locks and
+        // run for up to 120 seconds. Do not abort it at the generic 15-second
+        // timeout and accidentally turn a committed shot into a retry.
+        timeoutMs: 130_000,
         body: {
           username,
           bullets,
@@ -1249,7 +1326,8 @@
           const publicId = Number(favouriteCar.publicId);
           if (Number.isSafeInteger(publicId) && publicId > 0) {
             await queueAction(`/api/gta/cars/${encodeURIComponent(String(publicId))}/repair`, `Repairing beam car ${favouriteCar.name || ''}`.trim());
-            state.playerSearchDueAt = Date.now() + 50;
+            state.beamTravelRefreshPending = true;
+            state.playerSearchDueAt = Date.now();
             return true;
           }
         }
@@ -1258,7 +1336,8 @@
         });
         state.killData = null;
         state.killDataLoadedAt = 0;
-        state.playerSearchDueAt = Date.now() + 50;
+        state.beamTravelRefreshPending = true;
+        state.playerSearchDueAt = Date.now();
         return true;
       }
       if (mode === 'car') {
@@ -1280,7 +1359,8 @@
         });
         state.killData = null;
         state.killDataLoadedAt = 0;
-        state.playerSearchDueAt = Date.now() + 50;
+        state.beamTravelRefreshPending = true;
+        state.playerSearchDueAt = Date.now();
         return true;
       }
       const airportWait = Number(airport.secondsRemaining);
@@ -1301,7 +1381,10 @@
     } catch (error) {
       if (error instanceof ApiError && error.status === 404 && /player not found/i.test(error.message)) {
         removeNonLivingPlayer(username);
-        state.playerSearchDueAt = Date.now() + 50;
+        // A dead/replaced bodyguard is removed by removeNonLivingPlayer().
+        // Continue immediately so Beam rechecks the primary without relying
+        // on a background-tab timer to fire 50 ms later.
+        state.playerSearchDueAt = Date.now();
         return false;
       }
       throw error;
@@ -1399,6 +1482,7 @@
       }
       try {
         const result = await shootPlayer(blocker.name, required);
+        if (!result) return true;
         if (result && result.killed === true) {
           log(`Bodyguard ${blocker.name} removed — returning to ${primary}`, 'ok');
           state.activeBodyguard = null;
@@ -1412,7 +1496,7 @@
           throw error;
         }
       }
-      state.playerSearchDueAt = Date.now() + 50;
+      state.playerSearchDueAt = Date.now();
       return true;
     }
 
@@ -1431,6 +1515,7 @@
       }
     }
     const result = await shootPlayer(primary, bullets);
+    if (!result) return true;
     if (result && result.blockingBodyguard) {
       setActiveBodyguard(primary, result.blockingBodyguard);
       state.combatStatus = `Beam: searching bodyguard ${result.blockingBodyguard}`;
@@ -1458,6 +1543,7 @@
       return false;
     }
     const result = await shootPlayer(target, required);
+    if (!result) return true;
     if (result && result.killed === true) {
       const key = normalisePlayerName(target);
       state.playerActions[key] = { ...playerAction(target), kill: false };
@@ -1468,6 +1554,20 @@
     }
     state.playerSearchDueAt = Date.now() + 5_000;
     return true;
+  }
+
+  function beamContinuationReady() {
+    return Boolean(
+      activeBeamName()
+      && state.botTab
+      && state.controller
+      && state.settings.enabled
+      && !state.stoppedForDeath
+      && !state.authRequired
+      && !state.inJail
+      && state.globalRateLimitedUntil <= Date.now()
+      && state.playerSearchDueAt <= Date.now()
+    );
   }
 
   async function runPlayerSearch() {
@@ -1496,12 +1596,16 @@
       }
 
       const now = Date.now();
+      const continueTravelledBeam = state.beamTravelRefreshPending && Boolean(activeBeamName());
+      state.beamTravelRefreshPending = false;
       for (const [key, until] of state.playerSearchBackoff) {
         if (until <= now) state.playerSearchBackoff.delete(key);
       }
       const { pending, found } = killMaps(data);
       const renewalTarget = nextSearchRenewalTarget(data, now);
-      if (renewalTarget) {
+      // A due background renewal must not interrupt the first prepare/shoot
+      // step after Beam has travelled. It will be picked up on a later pass.
+      if (renewalTarget && !continueTravelledBeam) {
         await attemptKillSearch(renewalTarget, 'Renewing search for');
         return;
       }
@@ -1547,6 +1651,14 @@
     } finally {
       state.playerSearchRunning = false;
       refreshIdleStatus();
+      // Travel and successful Beam shots are multi-request workflows. Chain an
+      // immediately-due next step from the completed request instead of waiting
+      // for a browser timer, which may be throttled in a minimized bot tab.
+      if (beamContinuationReady()) {
+        queueMicrotask(() => {
+          if (!state.playerSearchRunning && beamContinuationReady()) void runPlayerSearch();
+        });
+      }
     }
   }
 
@@ -1887,7 +1999,7 @@
         <section class="ul-simple-tab-panel" data-tab-panel="players" role="tabpanel" hidden>
           <div class="ul-simple-section-title">Player discovery and kill search</div>
           <div class="ul-simple-player-controls">
-            <label title="Collect visible Players Online and public jail inmates"><input type="checkbox" id="ul-simple-discover-players"> Discover players</label>
+            <label title="Collect visible Players Online, public jail inmates, living gang members and successful player-steal victims"><input type="checkbox" id="ul-simple-discover-players"> Discover players</label>
             <label title="Search saved players and renew every active kill-page search, including manual and bodyguard searches"><input type="checkbox" id="ul-simple-search-players"> Search players</label>
           </div>
           <div class="ul-simple-beam-settings">
@@ -2052,6 +2164,7 @@
     discoverPlayers.addEventListener('change', () => {
       saveSettings({ discoverPlayers: discoverPlayers.checked });
       state.playerDiscoveryDueAt = 0;
+      state.gangDiscoveryDueAt = 0;
       state.jailDueAt = 0;
       state.playerDiscoveryStatus = discoverPlayers.checked
         ? `${state.playerNames.length.toLocaleString('en-GB')} players collected`
@@ -2085,6 +2198,7 @@
         state.playerActions[key] = { ...current, beam: control.checked };
         state.activeBodyguard = null;
         state.drugContextLoaded = false;
+        state.beamTravelRefreshPending = false;
       } else if (control.classList.contains('ul-simple-player-mode')) {
         state.playerActions[key] = { ...current, beamMode: control.value === 'kill' ? 'kill' : 'one' };
       }
