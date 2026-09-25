@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Underworld Legacy - Crimes & GTA
 // @namespace    https://underworldlegacy.com/
-// @version      1.10.0
-// @description  API-first UL automation with crimes, GTA, jailbust, melting, drugs, Auto Rank, player searches, Kill and Beam.
+// @version      1.18.0
+// @description  API-first UL automation with Quicktrade, Swiss funding, automatic character restart, username generation, optional asset retrieval and local login recovery.
 // @author       Aphotic
 // @updateURL    https://raw.githubusercontent.com/ssdddssdfswee/UL-Bot/main/ul-simple-crimes-gta-v1.0.0.user.js
 // @downloadURL  https://raw.githubusercontent.com/ssdddssdfswee/UL-Bot/main/ul-simple-crimes-gta-v1.0.0.user.js
@@ -13,6 +13,8 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_addValueChangeListener
+// @grant        GM_getTab
+// @grant        GM_saveTab
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -27,6 +29,22 @@
   const PLAYER_LIST_KEY = 'ul_simple_player_list_v1';
   const PLAYER_ACTIONS_KEY = 'ul_simple_player_actions_v1';
   const DEATH_STOP_KEY = 'ul_simple_death_stop_v1';
+  const QT_KEY = 'ul_simple_quicktrade_v1';
+  const RESTART_KEY = 'ul_simple_restart_settings_v1';
+  const RESTART_PROGRESS_KEY = 'ul_simple_restart_progress_v1';
+  const LOGIN_CREDENTIALS_KEY = 'ul_simple_login_credentials_v1';
+  const LOGIN_RECOVERY_KEY = 'ul_simple_login_recovery_v5';
+  const LOGIN_HANDOFF_KEY = 'ul_simple_login_handoff_v2';
+  const LOGIN_WINDOW_PREFIX = 'ul-simple-login-recovery-v2:';
+  const LOGIN_TAB_STATE_FIELD = 'ulSimpleCrimesGtaTabStateV3';
+  const LOGIN_SUCCESS_GUARD_KEY = 'ul_simple_login_success_guard_v1';
+  sessionStorage.removeItem('ul_simple_login_recovery_v1');
+  sessionStorage.removeItem('ul_simple_login_recovery_v2');
+  sessionStorage.removeItem('ul_simple_login_recovery_v3');
+  sessionStorage.removeItem('ul_simple_login_recovery_v4');
+  const LOGIN_RECOVERY_MAX_AGE_MS = 30 * 60_000;
+  const LOGIN_HANDOFF_MAX_AGE_MS = 2 * 60_000;
+  const LOGIN_RECOVERY_PROBE_MS = 2_000;
   const ONLINE_DISCOVERY_MS = 2 * 60_000;
   const GANG_DISCOVERY_MS = 10 * 60_000;
   const PLAYER_SEARCH_MIN_RENEW_LEAD_SECONDS = 30 * 60;
@@ -41,6 +59,8 @@
     search: { limit: 98, windowMs: 10_000 },
     crime: { limit: 98, windowMs: 10_000 },
     gta: { limit: 98, windowMs: 10_000 },
+    quicktrade: { limit: 98, windowMs: 10_000 },
+    retrieve: { limit: 19, windowMs: 30_000 },
   });
   // The server refills 20 global request tokens per second with a 100-request
   // burst. Keep a little headroom for ordinary play in another tab while still
@@ -89,16 +109,24 @@
   const state = {
     settings: loadSettings(),
     botTab: sessionStorage.getItem(BOT_TAB_KEY) === 'true',
-    uiTab: ['actions', 'cars', 'players', 'logs'].includes(sessionStorage.getItem(UI_TAB_KEY))
+    uiTab: ['actions', 'cars', 'players', 'quicktrade', 'restart', 'login', 'logs'].includes(sessionStorage.getItem(UI_TAB_KEY))
       ? sessionStorage.getItem(UI_TAB_KEY)
       : 'actions',
     controller: false,
     generation: 0,
+    apiInFlight: 0,
+    restart: sanitiseRestart(GM_getValue(RESTART_KEY, null)),
+    restartProgress: sanitiseRestartProgress(GM_getValue(RESTART_PROGRESS_KEY, null)),
+    restartRevision: 0,
+    restartRunning: false,
     controllerLockRequested: false,
     releaseController: null,
     inJail: false,
     jailMarkedAt: 0,
     authRequired: false,
+    loginRecovery: loadLoginRecovery(),
+    loginCredentials: loadLoginCredentials(),
+    loginCredentialStatus: '',
     globalRateLimitedUntil: 0,
     stoppedForDeath: GM_getValue(DEATH_STOP_KEY, false) === true,
     currentAction: 'Waiting for controller',
@@ -115,6 +143,15 @@
     combatDueAt: 0,
     beamTravelRefreshPending: false,
     jailDueAt: 0,
+    qt: loadQuicktrade(),
+    qtRevision: 0,
+    qtDueAt: 0,
+    qtRunning: false,
+    qtCatalogRunning: false,
+    qtLastKind: 'perks',
+    qtOfferRetryAt: new Map(),
+    qtCatalog: [],
+    qtStatus: 'Quicktrade purchasing disabled',
     crimesRunning: false,
     gtaRunning: false,
     jailBustRunning: false,
@@ -168,6 +205,12 @@
   let schedulerTimer = null;
   let schedulerWakeQueued = false;
   let schedulerStarted = false;
+  let loginRecoveryTimer = null;
+  let loginRecoveryProbeRunning = false;
+  let loginRecoveryLastProbeAt = 0;
+  let loginRecoverySubmitRunning = false;
+  let loginRecoveryLastRedirectAt = 0;
+  let restartTimer = null;
 
   class ApiError extends Error {
     constructor(status, message, body, retryAfter = 0) {
@@ -189,6 +232,1159 @@
   function loadSettings() {
     const stored = GM_getValue(SETTINGS_KEY, {});
     return sanitiseSettings({ ...DEFAULT_SETTINGS, ...(stored && typeof stored === 'object' ? stored : {}) });
+  }
+
+  // Decimal strings avoid rounding large game balances/prices through Number.
+  function qtInteger(value) {
+    if (typeof value === 'number' && !Number.isSafeInteger(value)) return '0';
+    const text = String(value ?? '').trim().replace(/[\s,]/g, '');
+    if (!/^\d{1,19}$/.test(text)) return '0';
+    const amount = BigInt(text);
+    return amount <= 9223372036854775807n ? amount.toString() : '0';
+  }
+
+  function sanitiseQuicktrade(value) {
+    const v = value && typeof value === 'object' ? value : {};
+    const ids = new Set();
+    const rules = (Array.isArray(v.rules) ? v.rules : []).slice(0, 100).flatMap((rule) => {
+      if (!rule || typeof rule !== 'object' || typeof rule.id !== 'string' || !/^[a-z0-9_-]{1,80}$/i.test(rule.id) || ids.has(rule.id)) return [];
+      if (typeof rule.label !== 'string' || !rule.label.trim() || rule.label.length > 250 || !['money', 'points'].includes(rule.currency)) return [];
+      ids.add(rule.id);
+      return [{ id: rule.id, label: rule.label.trim(), currency: rule.currency,
+        maxPrice: qtInteger(rule.maxPrice), remaining: qtInteger(rule.remaining), enabled: rule.enabled === true }];
+    });
+    return {
+      pointsEnabled: v.pointsEnabled === true,
+      pointsMaxPrice: qtInteger(v.pointsMaxPrice),
+      pointsRemaining: qtInteger(v.pointsRemaining),
+      perksEnabled: v.perksEnabled === true,
+      rules,
+      // Save pending purchases/withdrawals before dispatch. Neither API has
+      // an idempotency key, so a lost response must prevent automatic retries.
+      pending: v.pending && typeof v.pending === 'object' ? v.pending : null,
+    };
+  }
+
+  function loadQuicktrade() { return sanitiseQuicktrade(GM_getValue(QT_KEY, null)); }
+
+  function saveQuicktrade(patch, editedQuantityKey = '') {
+    const next = sanitiseQuicktrade({ ...state.qt, ...patch });
+    // Saving a quantity replaces the remaining budget, even when its numeric
+    // value equals the reservation. A rejected request must not undo that edit.
+    const pendingKey = next.pending?.kind === 'points' ? 'points' : next.pending?.ruleId;
+    if (next.pending && editedQuantityKey && editedQuantityKey === pendingKey) {
+      next.pending = { ...next.pending, quantityEdited: true };
+    }
+    GM_setValue(QT_KEY, next);
+    state.qt = next;
+    state.qtRevision += 1;
+    state.qtDueAt = 0;
+    render();
+    requestSchedulerWake();
+  }
+
+  function qtPointsReady() {
+    return state.qt.pointsEnabled && BigInt(state.qt.pointsMaxPrice) > 0n && BigInt(state.qt.pointsRemaining) > 0n;
+  }
+
+  function qtPerksReady() {
+    return state.qt.perksEnabled && state.qt.rules.some((r) => r.enabled && BigInt(r.maxPrice) > 0n && BigInt(r.remaining) > 0n);
+  }
+
+  function qtReady() { return !state.qt.pending && (qtPointsReady() || qtPerksReady()); }
+
+  function qtPointsCandidate(offer) {
+    if (!qtPointsReady() || !offer || offer.own !== false || !offer.id) return null;
+    const units = BigInt(qtInteger(offer.points));
+    const price = BigInt(qtInteger(offer.pricePerPoint));
+    const total = BigInt(qtInteger(offer.totalMoney));
+    if (units <= 0n || price <= 0n || total !== units * price || !Number.isSafeInteger(offer.offerCount) || offer.offerCount < 1) return null;
+    if (price > BigInt(state.qt.pointsMaxPrice) || units > BigInt(state.qt.pointsRemaining)) return null;
+    return { kind: 'points', id: String(offer.id), units: units.toString(), price, total };
+  }
+
+  function qtPerkCandidate(offer, ruleId = '') {
+    if (!state.qt.perksEnabled || !offer || offer.own !== false || !offer.id || !['money', 'points'].includes(offer.saleCurrency)) return null;
+    const price = BigInt(qtInteger(offer.salePrice));
+    if (price <= 0n || (offer.permanent !== true && (!Number.isFinite(Number(offer.expires)) || Number(offer.expires) <= 0))) return null;
+    const rule = state.qt.rules.find((r) => (!ruleId || r.id === ruleId) && r.enabled
+      && r.label === offer.label && r.currency === offer.saleCurrency
+      && BigInt(r.remaining) > 0n && price <= BigInt(r.maxPrice));
+    return rule ? { kind: 'perks', id: String(offer.id), ruleId: rule.id, label: rule.label, currency: rule.currency, units: '1', price } : null;
+  }
+
+  function rememberQtCatalog(data) {
+    const labels = new Set(state.qtCatalog);
+    for (const offer of Array.isArray(data.perkOffers) ? data.perkOffers : []) {
+      if (typeof offer.label === 'string' && offer.label.length <= 250) labels.add(offer.label);
+    }
+    state.qtCatalog = [...labels].sort((a, b) => a.localeCompare(b)).slice(0, 1000);
+  }
+
+  async function refreshQtCatalog() {
+    if (state.qtCatalogRunning) return;
+    if (!actionAllowed() || state.authRequired) {
+      state.qtStatus = 'Start the bot in this tab to load perk names. Purchasing toggles can stay off.';
+      render(); return;
+    }
+    state.qtCatalogRunning = true;
+    try {
+      const data = await api('/api/qt?a=perks&v=con', { priority: REQUEST_PRIORITY.NORMAL });
+      rememberQtCatalog(data);
+      state.qtStatus = `Loaded ${state.qtCatalog.length} perk names. Select or type the exact name.`;
+    } catch (error) {
+      handleTaskError('Quicktrade list', error);
+      state.qtStatus = `Could not load perks: ${error.message}`;
+    } finally { state.qtCatalogRunning = false; render(); }
+  }
+
+  async function buyQuicktrade(candidate) {
+    let revision = state.qtRevision;
+    const generation = state.generation;
+    let quoteAt = 0;
+    let pending = null;
+    const validate = () => {
+      if (generation !== state.generation || state.inJail) throw new ActionCancelledError('Quicktrade stopped or player jailed');
+      if (revision !== state.qtRevision || state.qt.pending || !qtReady()) throw new ActionCancelledError('Quicktrade settings changed');
+      if (quoteAt && Date.now() - quoteAt > 1500) throw new ActionCancelledError('Quicktrade quote needs refreshing');
+    };
+    const saveWorkflow = (patch) => {
+      // Our pending-marker writes may advance the revision, but must never
+      // hide a settings edit made by the user during an in-flight withdrawal.
+      const unchanged = revision === state.qtRevision;
+      saveQuicktrade(patch);
+      if (unchanged) revision = state.qtRevision;
+    };
+    const refreshQuote = async () => {
+      let refreshed;
+      if (candidate.kind === 'points') {
+        const data = await api('/api/qt?a=points', { priority: REQUEST_PRIORITY.NORMAL, validate });
+        const row = (Array.isArray(data.pointsOffers) ? data.pointsOffers : []).find((o) => String(o.id) === candidate.id);
+        refreshed = qtPointsCandidate(row);
+      } else {
+        const row = await api(`/api/perks/${encodeURIComponent(candidate.id)}`, { priority: REQUEST_PRIORITY.NORMAL, validate });
+        refreshed = row.forSale === true ? qtPerkCandidate(row, candidate.ruleId) : null;
+      }
+      if (!refreshed || refreshed.units !== candidate.units || refreshed.price !== candidate.price) {
+        throw new ActionCancelledError('Quicktrade listing changed or sold');
+      }
+    };
+    const fundCashPurchase = async () => {
+      const cost = candidate.kind === 'points' ? candidate.total : candidate.price;
+      const bank = await api('/api/bank', { priority: REQUEST_PRIORITY.NORMAL, validate });
+      // Bank moneyToJson returns decimal strings. Missing/rounded balances
+      // are not zero: refuse to move money if either balance is unreadable.
+      const balance = (value) => {
+        if (typeof value !== 'string' || !/^(0|[1-9]\d{0,18})$/.test(value) || BigInt(value) > 9223372036854775807n) {
+          throw new Error('Could not read Quicktrade cash/Swiss balances');
+        }
+        return BigInt(value);
+      };
+      const cash = balance(bank.money), swiss = balance(bank.swissMoney);
+      const shortfall = cost > cash ? cost - cash : 0n;
+      if (shortfall === 0n) return;
+      if (swiss < shortfall) throw new ApiError(400, 'Not enough cash plus Swiss for this Quicktrade offer', {});
+      const balanceAt = Date.now();
+      let withdrawalToken = null;
+      try {
+        // Already inside the economy queue: a nested queueAction would wait
+        // on itself. api still applies the global limiter and dispatch guards.
+        const result = await api('/api/bank/swiss', {
+          method: 'POST', body: { action: 'withdraw', amount: shortfall.toString() },
+          priority: REQUEST_PRIORITY.NORMAL, timeoutMs: 30_000,
+          validate: () => {
+            validate();
+            if (Date.now() - balanceAt > 1500) throw new ActionCancelledError('Swiss balance needs refreshing');
+          },
+          onDispatch: () => {
+            withdrawalToken = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+            saveWorkflow({ pending: { token: withdrawalToken, kind: 'swiss', amount: shortfall.toString() } });
+          },
+        });
+        if (!/^You withdrew\b/i.test(cleanMessage(result.html))) throw new Error('Swiss response did not confirm a withdrawal');
+        if (state.qt.pending?.token !== withdrawalToken) throw new ActionCancelledError('Swiss withdrawal state changed');
+        saveWorkflow({ pending: null });
+        log(`Quicktrade: withdrew $${shortfall.toLocaleString('en-GB')} from Swiss`, 'ok');
+      } catch (error) {
+        if (withdrawalToken && state.qt.pending?.token === withdrawalToken) {
+          if (error instanceof ApiError && [400, 401, 403, 404, 409, 429].includes(error.status)) {
+            saveWorkflow({ pending: null });
+          } else {
+            state.qtStatus = 'Swiss withdrawal unconfirmed. Check your bank before resuming Quicktrade.';
+            log(state.qtStatus, 'warn');
+          }
+        }
+        throw error;
+      }
+    };
+    try {
+      const result = await queueAction(candidate.kind === 'points' ? '/api/qt/accept' : '/api/qt/perks/buy',
+        candidate.kind === 'points' ? `Buying ${candidate.units} Quicktrade points` : `Buying perk: ${candidate.label}`, {
+          body: candidate.kind === 'points' ? { buy: 'points', id: candidate.id } : { ids: [candidate.id] },
+          priority: REQUEST_PRIORITY.NORMAL,
+          timeoutMs: 30_000,
+          validate,
+          beforeSend: async () => {
+            // This runs inside the shared spending lane, after earlier travel,
+            // repairs or shots finish. Never buy from an old queued snapshot.
+            await refreshQuote();
+            if (candidate.kind === 'points' || candidate.currency === 'money') {
+              await fundCashPurchase();
+              // A listing may disappear or change while banking is in flight.
+              await refreshQuote();
+            }
+            quoteAt = Date.now();
+          },
+          onDispatch: () => {
+            const remaining = candidate.kind === 'points' ? state.qt.pointsRemaining : state.qt.rules.find((r) => r.id === candidate.ruleId).remaining;
+            pending = { token: `${Date.now()}-${Math.random().toString(36).slice(2)}`, kind: candidate.kind,
+              ruleId: candidate.ruleId || '', units: candidate.units, reservedRemaining: (BigInt(remaining) - BigInt(candidate.units)).toString() };
+            const patch = candidate.kind === 'points'
+              ? { pointsRemaining: pending.reservedRemaining }
+              : { rules: state.qt.rules.map((r) => r.id === candidate.ruleId ? { ...r, remaining: pending.reservedRemaining } : r) };
+            saveQuicktrade({ ...patch, pending });
+          },
+        });
+      if (!/^You bought\b/i.test(cleanMessage(result.html))) throw new Error('Purchase response did not confirm a purchase');
+      if (state.qt.pending?.token === pending?.token) saveQuicktrade({ pending: null });
+      state.qtStatus = cleanMessage(result.html);
+      return true;
+    } catch (error) {
+      if (pending && state.qt.pending?.token === pending.token) {
+        const definitelyRejected = error instanceof ApiError && [400, 401, 403, 404, 409, 429].includes(error.status);
+        if (definitelyRejected) {
+          // Only restore the reservation if the user has not edited that limit.
+          const patch = { pending: null };
+          const quantityEdited = state.qt.pending.quantityEdited === true;
+          if (!quantityEdited && candidate.kind === 'points' && state.qt.pointsRemaining === pending.reservedRemaining) {
+            patch.pointsRemaining = (BigInt(state.qt.pointsRemaining) + BigInt(pending.units)).toString();
+          } else if (!quantityEdited && candidate.kind === 'perks') {
+            patch.rules = state.qt.rules.map((r) => r.id === pending.ruleId && r.remaining === pending.reservedRemaining
+              ? { ...r, remaining: (BigInt(r.remaining) + 1n).toString() } : r);
+          }
+          saveQuicktrade(patch);
+        } else {
+          state.qtStatus = 'Purchase unconfirmed. Check game transactions before resuming Quicktrade.';
+          log(state.qtStatus, 'warn');
+        }
+      }
+      throw error;
+    }
+  }
+
+  async function runQuicktrade() {
+    if (state.qtRunning || !qtReady()) return;
+    state.qtRunning = true;
+    const generation = state.generation;
+    let candidate = null;
+    try {
+      const [points, perks] = await Promise.all([
+        qtPointsReady() ? api('/api/qt?a=points', { priority: REQUEST_PRIORITY.NORMAL }) : null,
+        qtPerksReady() ? api('/api/qt?a=perks&v=con', { priority: REQUEST_PRIORITY.NORMAL }) : null,
+      ]);
+      if (perks) rememberQtCatalog(perks);
+      for (const [key, until] of state.qtOfferRetryAt) {
+        if (until <= Date.now()) state.qtOfferRetryAt.delete(key);
+      }
+      const available = (offer) => offer && !state.qtOfferRetryAt.has(`${offer.kind}:${offer.id}`);
+      const sort = (a, b) => a.price < b.price ? -1 : a.price > b.price ? 1 : 0;
+      const point = (points?.pointsOffers || []).map(qtPointsCandidate).filter(available).sort(sort)[0];
+      const perk = (perks?.perkOffers || []).map((o) => qtPerkCandidate(o)).filter(available)
+        .sort((a, b) => a.currency.localeCompare(b.currency) || sort(a, b))[0];
+      candidate = point && perk ? (state.qtLastKind === 'points' ? perk : point) : point || perk;
+      state.qtDueAt = Date.now() + 1000;
+      if (candidate) {
+        state.qtLastKind = candidate.kind;
+        await buyQuicktrade(candidate);
+        state.qtDueAt = Date.now();
+      } else state.qtStatus = 'Watching Quicktrade — no matching offers within your limits';
+    } catch (error) {
+      if (!(error instanceof ActionCancelledError)) handleTaskError('Quicktrade', error);
+      if (!state.qt.pending) state.qtStatus = error.message || 'Quicktrade check failed';
+      state.qtDueAt = Date.now() + (error instanceof ActionCancelledError ? 500 : errorBackoff(error));
+      if (candidate && !state.qt.pending && error instanceof ApiError && [400, 403, 404].includes(error.status)
+        && !error.body?.dead && !error.body?.inJail) {
+        // A cheap but unaffordable/blocked listing must not hide other offers.
+        // Retry this listing later; other candidates keep their normal budget.
+        state.qtOfferRetryAt.set(`${candidate.kind}:${candidate.id}`, Date.now() + 15_000);
+        if (state.qtOfferRetryAt.size > 1000) state.qtOfferRetryAt.delete(state.qtOfferRetryAt.keys().next().value);
+        state.qtDueAt = Date.now() + 100;
+      }
+    } finally {
+      state.qtRunning = false;
+      if (generation !== state.generation && !state.qt.pending) state.qtStatus = 'Quicktrade stopped';
+      render();
+    }
+  }
+
+  function validRestartName(value) {
+    const name = String(value ?? '').trim();
+    return name.length >= 2 && name.length <= 20 && /^[a-zA-Z0-9 _-]+$/.test(name) ? name : '';
+  }
+
+  function sanitiseRestart(value) {
+    const v = value && typeof value === 'object' ? value : {};
+    const seen = new Set();
+    const usernames = (Array.isArray(v.usernames) ? v.usernames : []).flatMap((raw) => {
+      const name = validRestartName(raw), key = name.toLowerCase();
+      if (!name || seen.has(key)) return [];
+      seen.add(key); return [name];
+    }).slice(0, 1000);
+    return { enabled: v.enabled === true, retrieveAssets: v.retrieveAssets === true, usernames };
+  }
+
+  function sanitiseRestartProgress(value) {
+    const v = value && typeof value === 'object' ? value : {};
+    return {
+      active: v.active === true, blocked: v.blocked === true,
+      userId: typeof v.userId === 'string' ? v.userId.slice(0, 100) : '',
+      oldUsername: validRestartName(v.oldUsername), username: validRestartName(v.username),
+      created: v.created === true, retrievalDone: v.retrievalDone === true,
+      pending: ['create', 'retrieve'].includes(v.pending) ? v.pending : '',
+      loginAttempted: v.loginAttempted === true, allowRetry: v.allowRetry === true,
+      dueAt: Number.isFinite(v.dueAt) && v.dueAt > 0 ? v.dueAt : 0,
+      message: typeof v.message === 'string' ? v.message.slice(0, 600) : '',
+    };
+  }
+
+  function saveRestartProgress(patch) {
+    state.restartProgress = sanitiseRestartProgress({ ...state.restartProgress, ...patch });
+    GM_setValue(RESTART_PROGRESS_KEY, state.restartProgress);
+    render();
+  }
+
+  function cancelRestart() {
+    if (state.restartProgress.active) {
+      // Keep any dispatched operation for reconciliation if the user resumes.
+      saveRestartProgress({ active: false, blocked: false, allowRetry: false, message: 'Automatic restart stopped' });
+    }
+  }
+
+  function saveRestart(patch) {
+    state.restart = sanitiseRestart({ ...state.restart, ...patch });
+    GM_setValue(RESTART_KEY, state.restart);
+    state.restartRevision += 1;
+    if (!state.restart.enabled) { state.generation += 1; cancelRestart(); }
+    else if (state.restartProgress.active) saveRestartProgress({ blocked: false, dueAt: 0 });
+    render();
+  }
+
+  function generateRestartNames(existing, count = 100) {
+    const first = ['Silent', 'Silver', 'Crimson', 'Hidden', 'Rapid', 'Frost', 'Iron', 'Lucky', 'Golden', 'Storm', 'Night', 'Wild', 'Stone', 'Amber', 'Royal', 'Arctic', 'Solar', 'Misty', 'Shadow', 'Cobalt', 'Scarlet', 'Velvet', 'Copper', 'Lunar'];
+    const last = ['Falcon', 'Wolf', 'Raven', 'Fox', 'Tiger', 'Lynx', 'Hawk', 'Viper', 'Panther', 'Badger', 'Otter', 'Owl', 'Drifter', 'Comet', 'Ranger', 'Sparrow', 'Ghost', 'Pilot', 'Nomad', 'Cobra', 'Finch', 'Heron', 'Lancer', 'Rook'];
+    const seen = new Set(existing.map((name) => String(name).trim().toLowerCase()));
+    const names = [];
+    for (let attempt = 0; names.length < count && attempt < count * 100; attempt++) {
+      const name = `${first[Math.floor(Math.random() * first.length)]}${last[Math.floor(Math.random() * last.length)]}${Math.floor(Math.random() * 9000) + 1000}`;
+      if (seen.has(name.toLowerCase())) continue;
+      seen.add(name.toLowerCase()); names.push(name);
+    }
+    return names;
+  }
+
+  function armRestart() {
+    if (!state.restart.enabled || !state.botTab) return false;
+    state.generation += 1;
+    clearLoginRecovery();
+    state.settings = sanitiseSettings({ ...state.settings, enabled: false });
+    GM_setValue(SETTINGS_KEY, state.settings);
+    saveRestartProgress({ active: true, blocked: false, dueAt: 0, message: 'Checking account before restart' });
+    return true;
+  }
+
+  function restartAllowed() {
+    return state.botTab && state.controller && state.restart.enabled
+      && state.restartProgress.active && !state.restartProgress.blocked;
+  }
+
+  function pauseRestart(message) {
+    saveRestartProgress({ blocked: true, message });
+    log(`Restart: ${message}`, 'warn');
+  }
+
+  function retryRestart() {
+    if (!state.restart.enabled || !state.botTab || state.restartRunning) return;
+    if (!state.restartProgress.active && !state.stoppedForDeath && !state.restartProgress.pending) return;
+    armRestart();
+    saveRestartProgress({ allowRetry: true, loginAttempted: false, message: 'Rechecking account before retry' });
+    restartTick();
+  }
+
+  async function runRestart() {
+    if (!restartAllowed() || state.restartRunning) return;
+    // Drain old requests before rotating the session. Queued gameplay requests
+    // are invalidated by generation and cannot dispatch during this workflow.
+    if (state.apiInFlight || loginRecoverySubmitRunning || loginRecoveryProbeRunning) return;
+    state.restartRunning = true;
+    const generation = state.generation;
+    let revision = state.restartRevision;
+    let stage = 'check';
+    const check = () => {
+      if (!restartAllowed() || generation !== state.generation || revision !== state.restartRevision) {
+        throw new ActionCancelledError('Restart stopped or settings changed');
+      }
+    };
+    const request = async (path, options = {}) => {
+      const data = await api(path, { ...options, restartFlow: true, priority: REQUEST_PRIORITY.NORMAL, validate: check });
+      check(); return data;
+    };
+    const removeName = (name) => {
+      saveRestart({ usernames: state.restart.usernames.filter((n) => n.toLowerCase() !== name.toLowerCase()) });
+      revision = state.restartRevision;
+    };
+    const mutate = async (kind, path, body) => {
+      try {
+        return await request(path, { method: 'POST', body, timeoutMs: 60_000,
+          onDispatch: () => saveRestartProgress({ pending: kind, allowRetry: false }) });
+      } catch (error) {
+        if (generation === state.generation && error instanceof ApiError && [400, 401, 403, 404, 409, 429].includes(error.status)) {
+          saveRestartProgress({ pending: '' });
+        }
+        throw error;
+      }
+    };
+    try {
+      let identity;
+      try { identity = await request('/api/auth/me'); }
+      catch (error) {
+        if (!(error instanceof ApiError) || error.status !== 401) throw error;
+        stage = 'login';
+        if (state.restartProgress.loginAttempted) return pauseRestart('Login was not confirmed. Log in manually or check the Login tab and retry.');
+        const credentials = loadLoginCredentials();
+        if (!credentials.autoLogin || !hasSavedLoginCredentials(credentials)) {
+          return pauseRestart('Login required. Save your existing email/password and enable Auto-login in the Login tab, or log in manually, then retry.');
+        }
+        saveRestartProgress({ message: 'Logging in to the existing account' });
+        identity = await request('/api/auth/login', { method: 'POST', timeoutMs: 20_000,
+          body: { email: credentials.email, password: credentials.password },
+          onDispatch: () => saveRestartProgress({ loginAttempted: true }) });
+        saveRestartProgress({ loginAttempted: false });
+      }
+      stage = 'check';
+      if (!identity?.user?.id || typeof identity.dead !== 'boolean' || typeof identity.emailVerified !== 'boolean') throw new Error('Could not verify the logged-in account');
+      if (state.restartProgress.userId && state.restartProgress.userId !== identity.user.id) {
+        return pauseRestart('The logged-in account has changed. Stop automatic restart and check the account.');
+      }
+      saveRestartProgress({ userId: identity.user.id });
+      if (!identity.emailVerified) return pauseRestart('Email verification is required. Complete it normally, then retry.');
+      let status = await request('/api/death/status');
+      if (typeof status.dead !== 'boolean' || !validRestartName(status.username)) throw new Error('Could not verify the current character');
+      if (status.dead) {
+        if (state.restartProgress.created || (state.restartProgress.oldUsername && state.restartProgress.oldUsername !== status.username)) {
+          return pauseRestart('The character changed or died again during restart. Check the game before continuing.');
+        }
+        if (state.restartProgress.pending === 'create' && !state.restartProgress.allowRetry) {
+          return pauseRestart('Character creation was not confirmed. Check the game, then use Retry after checking.');
+        }
+        const username = state.restartProgress.username || state.restart.usernames[0];
+        if (!username) return pauseRestart('No usernames remaining. Add names or generate 100, then save the list.');
+        saveRestartProgress({ oldUsername: status.username, username, message: `Creating ${username}` });
+        stage = 'create';
+        const result = await mutate('create', '/api/death/restart', { username });
+        if (result.ok !== true || result.username !== username) throw new Error('Character creation response was not confirmed');
+        saveRestartProgress({ pending: '', created: true });
+        removeName(username);
+        status = await request('/api/death/status');
+      } else {
+        if (state.restartProgress.username && state.restartProgress.username !== status.username) {
+          return pauseRestart('The active username does not match the pending restart. Check the game before continuing.');
+        }
+        // A lost success response or page reload is reconciled from the live
+        // character; never send another create request once it already exists.
+        if (state.restartProgress.pending === 'create') removeName(status.username);
+        saveRestartProgress({ username: status.username, created: true,
+          pending: state.restartProgress.pending === 'create' ? '' : state.restartProgress.pending });
+      }
+      if (status.dead !== false || status.username !== state.restartProgress.username) {
+        return pauseRestart('The new character could not be confirmed alive. Check the game before continuing.');
+      }
+      stage = 'retrieve';
+      if ((!state.restartProgress.retrievalDone && state.restart.retrieveAssets) || state.restartProgress.pending === 'retrieve') {
+        saveRestartProgress({ message: 'Checking assets available to retrieve' });
+        const data = await request('/api/retrieve');
+        const totals = data.retrievalTotals;
+        if (!totals || !['swissMoney', 'points'].every((key) => typeof totals[key] === 'string' && /^\d{1,36}$/.test(totals[key]))
+          || !Number.isSafeInteger(totals.retrievableCarCount) || totals.retrievableCarCount < 0) throw new Error('Could not read the retrieval totals');
+        const available = BigInt(totals.swissMoney) > 0n || BigInt(totals.points) > 0n || totals.retrievableCarCount > 0;
+        if (available && state.restartProgress.pending === 'retrieve' && !state.restartProgress.allowRetry) {
+          return pauseRestart('Asset retrieval was not confirmed. Check Retrieve Accounts before retrying.');
+        }
+        if (available && state.restart.retrieveAssets) {
+          saveRestartProgress({ message: 'Retrieving Swiss, points and eligible cars (normal tax/fees apply)' });
+          const result = await mutate('retrieve', '/api/retrieve/all', {});
+          if (!/^Retrieved\b/i.test(cleanMessage(result.html))) throw new Error('Asset retrieval response was not confirmed');
+          log(cleanMessage(result.html), 'ok');
+        }
+        saveRestartProgress({ pending: '', retrievalDone: true });
+      }
+      stage = 'finish';
+      const finalStatus = await request('/api/death/status');
+      if (finalStatus.dead !== false || finalStatus.username !== state.restartProgress.username) return pauseRestart('Character changed before resuming. Check the game.');
+      const username = finalStatus.username;
+      state.generation += 1;
+      prepareRuntimeForStart(true);
+      state.settings = sanitiseSettings({ ...state.settings, enabled: true });
+      GM_setValue(SETTINGS_KEY, state.settings);
+      state.restartProgress = sanitiseRestartProgress(null);
+      saveRestartProgress({ message: `Restart complete — ${username}` });
+      log(`Restart complete: ${username} — resuming saved bot modules`, 'ok');
+      // Leave public/death pages after the new session and retrieval are ready.
+      if (isLoginPage() || /^\/death(?:\/|$)/.test(location.pathname)) {
+        setLoginSuccessGuard(); location.replace('/home');
+      }
+      wakeAll();
+    } catch (error) {
+      if (error instanceof ActionCancelledError || generation !== state.generation) return;
+      if (error instanceof ApiError && error.status === 429) {
+        if (stage === 'login') saveRestartProgress({ loginAttempted: false });
+        saveRestartProgress({ dueAt: Date.now() + Math.max(1000, errorBackoff(error)), message: 'Server rate limit — waiting before retry' });
+      } else if (stage === 'create' && error instanceof ApiError && error.status === 400 && /username is already taken/i.test(error.message)) {
+        const name = state.restartProgress.username;
+        removeName(name);
+        saveRestartProgress({ username: '', pending: '', dueAt: Date.now() + 500, message: `${name} is taken — trying the next name` });
+      } else if (!(error instanceof ApiError && [400, 401, 403, 404, 409].includes(error.status))
+        && (state.restartProgress.pending || (stage === 'login' && state.restartProgress.loginAttempted))) {
+        // Read-only reconciliation may establish success after a lost response.
+        // If it cannot, the next check pauses without repeating the mutation.
+        saveRestartProgress({ dueAt: Date.now() + 2000, message: 'Response lost — checking account state before continuing' });
+      } else if (error instanceof ApiError && error.status === 401 && stage !== 'login') {
+        saveRestartProgress({ dueAt: Date.now() + 1000, message: 'Session changed — checking login again' });
+      } else if (state.restartProgress.pending || stage === 'login' || (error instanceof ApiError && [400, 401, 403, 404, 409].includes(error.status))) {
+        pauseRestart(`${error.message || 'Request unconfirmed'}. Check the game and retry${stage === 'retrieve' ? ', or turn asset retrieval off to resume without it' : ''}.`);
+      } else {
+        saveRestartProgress({ dueAt: Date.now() + 5000, message: `Restart check failed: ${error.message || 'Connection error'}` });
+      }
+    } finally {
+      state.restartRunning = false;
+      render(); requestSchedulerWake();
+    }
+  }
+
+  function restartTick() {
+    if (state.botTab && state.controller && state.restart.enabled && state.settings.enabled
+      && location.pathname === '/death' && !loginSuccessGuardActive()) stopAutomationForDeath();
+    if (restartAllowed() && !state.restartRunning && state.restartProgress.dueAt <= Date.now()) void runRestart();
+  }
+
+  function startRestartWatcher() {
+    if (restartTimer !== null) return;
+    restartTimer = setInterval(restartTick, 500);
+    restartTick();
+  }
+
+  function sanitiseLoginCredentials(value) {
+    const email = typeof (value && value.email) === 'string' ? value.email.trim() : '';
+    const password = typeof (value && value.password) === 'string' ? value.password : '';
+    return {
+      email,
+      password,
+      autoLogin: value && value.autoLogin === false ? false : true,
+    };
+  }
+
+  function loadLoginCredentials() {
+    const stored = GM_getValue(LOGIN_CREDENTIALS_KEY, null);
+    return sanitiseLoginCredentials(stored && typeof stored === 'object' ? stored : null);
+  }
+
+  function hasSavedLoginCredentials(credentials = state.loginCredentials) {
+    return !!(credentials && credentials.email && credentials.password);
+  }
+
+  function saveLocalLoginCredentials(email, password, autoLogin) {
+    const next = sanitiseLoginCredentials({ email, password, autoLogin });
+    if (!next.email || !next.password) return false;
+    state.loginCredentials = next;
+    GM_setValue(LOGIN_CREDENTIALS_KEY, next);
+    state.loginCredentialStatus = 'Login saved locally in Tampermonkey';
+    log('Login credentials saved locally in Tampermonkey', 'ok');
+    return true;
+  }
+
+  function clearLocalLoginCredentials() {
+    state.loginCredentials = sanitiseLoginCredentials(null);
+    GM_setValue(LOGIN_CREDENTIALS_KEY, null);
+    state.loginCredentialStatus = 'Saved login cleared';
+    log('Saved login cleared from Tampermonkey', 'info');
+  }
+
+  function isLoginPage() {
+    // Underworld Legacy serves the login form at the site root (/).
+    // There is no dedicated /login route; unauthenticated game pages redirect here.
+    return location.pathname === '/';
+  }
+
+  function currentRelativeUrl() {
+    return `${location.pathname}${location.search}${location.hash}`;
+  }
+
+  function setLoginSuccessGuard(durationMs = 10_000) {
+    try {
+      sessionStorage.setItem(LOGIN_SUCCESS_GUARD_KEY, String(Date.now() + durationMs));
+    } catch {}
+  }
+
+  function loginSuccessGuardActive() {
+    try {
+      const until = Number(sessionStorage.getItem(LOGIN_SUCCESS_GUARD_KEY) || 0);
+      if (Number.isFinite(until) && until > Date.now()) return true;
+      sessionStorage.removeItem(LOGIN_SUCCESS_GUARD_KEY);
+    } catch {}
+    return false;
+  }
+
+  function safeReturnUrl(value) {
+    const url = String(value || '');
+    if (!url.startsWith('/') || url.startsWith('//') || url === '/' || /^\/login(?:[/?#]|$)/.test(url)) return '/home';
+    return url;
+  }
+
+  function makeLoginRecoveryToken() {
+    try {
+      const bytes = new Uint8Array(16);
+      crypto.getRandomValues(bytes);
+      return Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('');
+    } catch {
+      return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    }
+  }
+
+  function sanitiseLoginRecovery(value) {
+    const startedAt = Number(value && value.startedAt);
+    if (!value || value.active !== true || !Number.isFinite(startedAt) || Date.now() - startedAt > LOGIN_RECOVERY_MAX_AGE_MS) {
+      return null;
+    }
+    const submittedAt = Number(value.submittedAt);
+    const retryAfterUntil = Number(value.retryAfterUntil);
+    return {
+      active: true,
+      startedAt,
+      returnUrl: safeReturnUrl(value.returnUrl),
+      token: typeof value.token === 'string' ? value.token.slice(0, 100) : '',
+      submittedAt: Number.isFinite(submittedAt) && submittedAt >= startedAt ? submittedAt : 0,
+      attemptBlocked: value.attemptBlocked === true,
+      retryAfterUntil: Number.isFinite(retryAfterUntil) && retryAfterUntil > 0 ? retryAfterUntil : 0,
+    };
+  }
+
+  function loadLoginRecovery() {
+    try {
+      const parsed = JSON.parse(sessionStorage.getItem(LOGIN_RECOVERY_KEY) || 'null');
+      const recovery = sanitiseLoginRecovery(parsed);
+      if (!recovery) sessionStorage.removeItem(LOGIN_RECOVERY_KEY);
+      return recovery;
+    } catch {
+      sessionStorage.removeItem(LOGIN_RECOVERY_KEY);
+      return null;
+    }
+  }
+
+  function setLoginWindowToken(token) {
+    if (!token) return;
+    try { window.name = `${LOGIN_WINDOW_PREFIX}${token}`; } catch {}
+  }
+
+  function getLoginWindowToken() {
+    try {
+      const name = String(window.name || '');
+      return name.startsWith(LOGIN_WINDOW_PREFIX) ? name.slice(LOGIN_WINDOW_PREFIX.length) : '';
+    } catch {
+      return '';
+    }
+  }
+
+  function clearLoginWindowToken(token = '') {
+    try {
+      const current = getLoginWindowToken();
+      if (current && (!token || current === token)) window.name = '';
+    } catch {}
+  }
+
+  function saveLoginHandoff(recovery) {
+    if (!recovery || !recovery.token) return;
+    // GM_setValue is the synchronous handoff. Unlike sessionStorage it is shared
+    // by the same userscript across www/non-www redirects. window.name tags the
+    // originating browser tab so another ordinary game tab does not take over.
+    GM_setValue(LOGIN_HANDOFF_KEY, {
+      token: recovery.token,
+      startedAt: recovery.startedAt,
+      returnUrl: recovery.returnUrl,
+    });
+    setLoginWindowToken(recovery.token);
+  }
+
+  function loadLoginHandoff() {
+    const raw = GM_getValue(LOGIN_HANDOFF_KEY, null);
+    if (!raw || typeof raw !== 'object') return null;
+    const startedAt = Number(raw.startedAt);
+    const token = typeof raw.token === 'string' ? raw.token : '';
+    if (!token || !Number.isFinite(startedAt) || Date.now() - startedAt > LOGIN_HANDOFF_MAX_AGE_MS) {
+      GM_setValue(LOGIN_HANDOFF_KEY, null);
+      return null;
+    }
+    return {
+      active: true,
+      startedAt,
+      returnUrl: safeReturnUrl(raw.returnUrl),
+      token,
+      submittedAt: 0,
+      attemptBlocked: false,
+      retryAfterUntil: 0,
+    };
+  }
+
+  function savePerTabState() {
+    if (typeof GM_getTab !== 'function' || typeof GM_saveTab !== 'function') return;
+    // Persist only the identity of the bot tab. Login recovery itself must not be
+    // stored in GM tab state: GM_saveTab is asynchronous, so an old active
+    // recovery snapshot can survive the successful-login navigation and then be
+    // restored on /home, resurrecting the redirect loop. Recovery handoff uses
+    // the synchronous GM value + window.name/sessionStorage mechanisms instead.
+    const snapshot = {
+      botTab: state.botTab === true,
+      savedAt: Date.now(),
+    };
+    try {
+      GM_getTab((tab) => {
+        const next = tab && typeof tab === 'object' ? tab : {};
+        next[LOGIN_TAB_STATE_FIELD] = snapshot;
+        GM_saveTab(next);
+      });
+    } catch {
+      // The synchronous GM handoff + window.name remain the redirect-safe path.
+    }
+  }
+
+  function restorePerTabState(done) {
+    if (typeof GM_getTab !== 'function') {
+      done();
+      return;
+    }
+    try {
+      GM_getTab((tab) => {
+        try {
+          const next = tab && typeof tab === 'object' ? tab : {};
+          const saved = next[LOGIN_TAB_STATE_FIELD];
+          if (saved && typeof saved === 'object' && typeof saved.botTab === 'boolean') {
+            state.botTab = saved.botTab;
+            sessionStorage.setItem(BOT_TAB_KEY, state.botTab ? 'true' : 'false');
+          }
+
+          // Clean up any recovery payload written by older builds. Never restore
+          // it after navigation; only the bot-tab boolean belongs in per-tab state.
+          next[LOGIN_TAB_STATE_FIELD] = { botTab: state.botTab === true, savedAt: Date.now() };
+          if (typeof GM_saveTab === 'function') GM_saveTab(next);
+        } finally {
+          done();
+        }
+      });
+    } catch {
+      done();
+    }
+  }
+
+  function saveLoginRecovery(returnUrl = currentRelativeUrl()) {
+    const existing = loadLoginRecovery() || sanitiseLoginRecovery(state.loginRecovery);
+    const recovery = existing || {
+      active: true,
+      startedAt: Date.now(),
+      returnUrl: safeReturnUrl(returnUrl),
+      token: makeLoginRecoveryToken(),
+      submittedAt: 0,
+      attemptBlocked: false,
+      retryAfterUntil: 0,
+    };
+    if (!recovery.token) recovery.token = makeLoginRecoveryToken();
+    sessionStorage.setItem(LOGIN_RECOVERY_KEY, JSON.stringify(recovery));
+    state.loginRecovery = recovery;
+    saveLoginHandoff(recovery); // synchronous before any redirect
+    savePerTabState();
+    return recovery;
+  }
+
+  function updateLoginRecovery(patch) {
+    const recovery = sanitiseLoginRecovery({ ...(loadLoginRecovery() || state.loginRecovery || {}), ...patch });
+    if (!recovery) return null;
+    sessionStorage.setItem(LOGIN_RECOVERY_KEY, JSON.stringify(recovery));
+    state.loginRecovery = recovery;
+    savePerTabState();
+    return recovery;
+  }
+
+  function adoptLoginHandoff() {
+    if (!isLoginPage()) return null;
+    const handoff = loadLoginHandoff();
+    if (!handoff) return null;
+
+    const windowToken = getLoginWindowToken();
+    // Prefer the exact tab token. If a browser/redirect has stripped window.name,
+    // fall back only while a very fresh bot-generated handoff exists and the bot
+    // is globally enabled. This prevents a lost token from making recovery inert.
+    const belongsHere = windowToken === handoff.token || state.botTab;
+    if (!belongsHere) return null;
+
+    state.loginRecovery = handoff;
+    state.botTab = true;
+    state.authRequired = true;
+    sessionStorage.setItem(LOGIN_RECOVERY_KEY, JSON.stringify(handoff));
+    sessionStorage.setItem(BOT_TAB_KEY, 'true');
+    setLoginWindowToken(handoff.token);
+    savePerTabState();
+    state.currentAction = 'Login recovery armed — waiting for saved login';
+    log('Login recovery: redirect handoff restored in this tab', 'info');
+    render();
+    return handoff;
+  }
+
+  function clearLoginRecovery() {
+    const token = state.loginRecovery && state.loginRecovery.token;
+    sessionStorage.removeItem(LOGIN_RECOVERY_KEY);
+    const handoff = loadLoginHandoff();
+    if (!handoff || !token || handoff.token === token) GM_setValue(LOGIN_HANDOFF_KEY, null);
+    clearLoginWindowToken(token || '');
+    state.loginRecovery = null;
+    loginRecoveryLastProbeAt = 0;
+    savePerTabState();
+  }
+
+  function loginElements() {
+    const email = document.querySelector('#login-email');
+    const password = document.querySelector('#login-password');
+    const submit = document.querySelector('#login-button');
+    const form = submit ? submit.closest('form') : null;
+    return { email, password, submit, form };
+  }
+
+  function markLoginRecoverySubmitted() {
+    const recovery = loadLoginRecovery() || state.loginRecovery || adoptLoginHandoff();
+    if (!recovery) return;
+    updateLoginRecovery({ submittedAt: Date.now(), attemptBlocked: true });
+    state.authRequired = true;
+    state.currentAction = 'Manual login submitted — waiting for session';
+    loginRecoveryLastProbeAt = 0;
+    render();
+  }
+
+  function prepareLoginFormForRecovery() {
+    if (!isLoginPage()) return false;
+    const { email, password, submit, form } = loginElements();
+    if (!email || !password || !submit || !form) return false;
+    if (form.dataset.ulSimpleLoginRecoveryBound !== 'true') {
+      form.dataset.ulSimpleLoginRecoveryBound = 'true';
+      form.addEventListener('submit', (event) => {
+        // Prevent a manual click from racing the one saved-credential request.
+        if (loginRecoverySubmitRunning) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          return;
+        }
+        markLoginRecoverySubmitted();
+      }, true);
+    }
+    return true;
+  }
+
+  async function submitSavedLoginOnce(recovery) {
+    if (loginRecoverySubmitRunning || !recovery || recovery.attemptBlocked) return false;
+    if (!state.botTab || !state.controller || !state.settings.enabled || state.restartProgress.active) return false;
+    const retryAfterUntil = Number(recovery.retryAfterUntil) || 0;
+    if (retryAfterUntil > Date.now()) {
+      state.loginCredentialStatus = `Login retry blocked for ${Math.ceil((retryAfterUntil - Date.now()) / 1000)}s by server rate limit`;
+      render();
+      return false;
+    }
+    const credentials = loadLoginCredentials();
+    state.loginCredentials = credentials;
+    if (!credentials.autoLogin || !hasSavedLoginCredentials(credentials)) return false;
+
+    loginRecoverySubmitRunning = true;
+    updateLoginRecovery({ submittedAt: Date.now(), attemptBlocked: true });
+    state.authRequired = true;
+    state.currentAction = 'Auto-login — sending one saved login request';
+    state.loginCredentialStatus = 'Auto-login in progress';
+    log('Login recovery: sending one saved Tampermonkey login request', 'info');
+    render();
+
+    // Copy only into short-lived local variables for the request. They are never
+    // written to logs, URLs, sessionStorage, localStorage or the bot settings.
+    let emailValue = credentials.email;
+    let passwordValue = credentials.password;
+    const generation = state.generation;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 20_000);
+    const stillCurrent = () => generation === state.generation && state.botTab && state.controller
+      && state.settings.enabled && !state.restartProgress.active;
+    try {
+      const body = JSON.stringify({ email: emailValue, password: passwordValue });
+      emailValue = '';
+      passwordValue = '';
+
+      const response = await fetch(new URL('/api/auth/login', location.origin), {
+        method: 'POST',
+        credentials: 'include',
+        cache: 'no-store',
+        signal: controller.signal,
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+        },
+        body,
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!stillCurrent()) return false;
+
+      if (!response.ok) {
+        const retryAfter = clampInteger(response.headers.get('retry-after'), 0, 3600, 0);
+        const message = cleanMessage(data.error || data.message) || `HTTP ${response.status}`;
+        const retryAfterUntil = response.status === 429 && retryAfter > 0
+          ? Date.now() + retryAfter * 1000 + 50
+          : 0;
+        updateLoginRecovery({ submittedAt: 0, attemptBlocked: true, retryAfterUntil });
+        state.currentAction = retryAfterUntil > 0
+          ? `Auto-login rate-limited — retry after ${retryAfter}s`
+          : `Auto-login failed — ${message}`;
+        state.loginCredentialStatus = state.currentAction;
+        log(`Login recovery: ${message}`, 'error');
+        render();
+        if (retryAfterUntil > 0) setTimeout(render, Math.max(100, retryAfterUntil - Date.now() + 100));
+        ensureLoginRecoveryPage(state.loginRecovery || recovery);
+        return false;
+      }
+
+      if (data.emailVerified === false) {
+        clearLoginRecovery();
+        state.authRequired = true;
+        state.currentAction = 'Email verification required';
+        state.loginCredentialStatus = 'Email verification required';
+        render();
+        location.assign('/verify-email');
+        return true;
+      }
+      if (data.dead === true) {
+        clearLoginRecovery();
+        stopAutomationForDeath();
+        if (location.pathname !== '/death') location.assign('/death');
+        return true;
+      }
+
+      const returnUrl = safeReturnUrl(recovery.returnUrl);
+      // Login succeeded while we are still physically on the public root page.
+      // Guard the short navigation gap so the 500ms recovery watcher cannot see
+      // "no recovery + / + enabled bot" and incorrectly arm a fresh login cycle.
+      setLoginSuccessGuard();
+      clearLoginRecovery();
+      state.authRequired = false;
+      state.currentAction = 'Login restored — resuming bot';
+      state.loginCredentialStatus = 'Auto-login successful';
+      log('Login restored — resuming saved bot modules', 'ok');
+      if (isLoginPage() && currentRelativeUrl() !== returnUrl) {
+        location.replace(returnUrl);
+      } else {
+        wakeAll();
+        requestSchedulerWake();
+      }
+      return true;
+    } catch (error) {
+      if (!stillCurrent()) return false;
+      updateLoginRecovery({ submittedAt: 0, attemptBlocked: true, retryAfterUntil: 0 });
+      const message = error?.name === 'AbortError' ? 'Login timed out — check the game before retrying' : cleanMessage(error && error.message) || 'Could not connect to server';
+      state.currentAction = `Auto-login request failed — ${message}`;
+      state.loginCredentialStatus = state.currentAction;
+      log(`Login recovery: ${message}`, 'error');
+      render();
+      ensureLoginRecoveryPage(state.loginRecovery || recovery);
+      return false;
+    } finally {
+      clearTimeout(timeout);
+      emailValue = '';
+      passwordValue = '';
+      loginRecoverySubmitRunning = false;
+    }
+  }
+
+  function retrySavedLogin() {
+    const recovery = loadLoginRecovery() || state.loginRecovery || (state.authRequired ? saveLoginRecovery('/home') : null);
+    state.loginCredentials = loadLoginCredentials();
+    if (!recovery || !hasSavedLoginCredentials() || !state.loginCredentials.autoLogin) return false;
+    const retryAfterUntil = Number(recovery.retryAfterUntil) || 0;
+    if (retryAfterUntil > Date.now()) {
+      state.loginCredentialStatus = `Server rate limit — retry in ${Math.ceil((retryAfterUntil - Date.now()) / 1000)}s`;
+      render();
+      return false;
+    }
+    const next = updateLoginRecovery({ submittedAt: 0, attemptBlocked: false, retryAfterUntil: 0 }) || recovery;
+    state.loginCredentialStatus = 'Retrying saved login';
+    if (isLoginPage()) void submitSavedLoginOnce(next);
+    else ensureLoginRecoveryPage(next);
+    return true;
+  }
+
+  function ensureLoginRecoveryPage(recovery) {
+    if (!recovery || isLoginPage()) return false;
+    const now = Date.now();
+    if (now - loginRecoveryLastRedirectAt < 1_500) return false;
+    loginRecoveryLastRedirectAt = now;
+    const target = new URL('/', location.origin).href;
+    try {
+      location.replace(target);
+    } catch {
+      try { window.location.href = target; } catch {}
+    }
+    return true;
+  }
+
+  function beginLoginRecovery() {
+    if (state.authRequired && state.loginRecovery) {
+      ensureLoginRecoveryPage(state.loginRecovery);
+      return;
+    }
+    const returnUrl = isLoginPage() ? '/home' : currentRelativeUrl();
+    const recovery = saveLoginRecovery(returnUrl);
+    state.generation += 1;
+    state.authRequired = true;
+    state.loginCredentials = loadLoginCredentials();
+    state.currentAction = state.loginCredentials.autoLogin && hasSavedLoginCredentials()
+      ? 'Session expired — opening login for automatic recovery'
+      : 'Session expired — login required';
+    log(state.loginCredentials.autoLogin && hasSavedLoginCredentials()
+      ? 'Session expired — opening login for one saved Tampermonkey login attempt'
+      : 'Session expired — no enabled saved login; opening the normal login page', 'warn');
+    requestSchedulerWake();
+    if (!isLoginPage()) ensureLoginRecoveryPage(recovery);
+    else {
+      prepareLoginFormForRecovery();
+      render();
+    }
+  }
+
+  async function probeLoginRecovery(recovery) {
+    if (!recovery || loginRecoveryProbeRunning || isLoginPage()) return;
+    const submittedAt = Number(recovery.submittedAt) || 0;
+    if (submittedAt <= 0) return;
+    const now = Date.now();
+    if (now - loginRecoveryLastProbeAt < LOGIN_RECOVERY_PROBE_MS) return;
+
+    loginRecoveryLastProbeAt = now;
+    loginRecoveryProbeRunning = true;
+    const generation = state.generation;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15_000);
+    try {
+      const response = await fetch(new URL('/api/auth/me', location.origin), {
+        method: 'GET',
+        credentials: 'include',
+        cache: 'no-store',
+        signal: controller.signal,
+        headers: { Accept: 'application/json' },
+      });
+      if (response.status === 401 || !response.ok) return;
+      const data = await response.json().catch(() => ({}));
+      if (generation !== state.generation || !state.botTab || !state.settings.enabled || state.restartProgress.active) return;
+      if (data.dead === true) {
+        clearLoginRecovery();
+        stopAutomationForDeath();
+        if (location.pathname !== '/death') location.assign('/death');
+        return;
+      }
+      if (data.emailVerified === false) {
+        clearLoginRecovery();
+        state.authRequired = true;
+        state.currentAction = 'Email verification required before the bot can resume';
+        render();
+        if (location.pathname !== '/verify-email') location.assign('/verify-email');
+        return;
+      }
+      const returnUrl = safeReturnUrl(recovery.returnUrl);
+      setLoginSuccessGuard();
+      clearLoginRecovery();
+      state.authRequired = false;
+      state.currentAction = 'Login restored — resuming bot';
+      log('Login restored — resuming saved bot modules', 'ok');
+      if (currentRelativeUrl() !== returnUrl) {
+        location.replace(returnUrl);
+      } else {
+        wakeAll();
+        requestSchedulerWake();
+      }
+    } catch {
+      // Manual login recovery can be checked again on the next low-frequency tick.
+    } finally {
+      clearTimeout(timeout);
+      loginRecoveryProbeRunning = false;
+    }
+  }
+
+  function loginRecoveryTick() {
+    // Restart owns authentication until the new character has been verified.
+    if (state.restartProgress.active) return;
+    if (!state.botTab && !adoptLoginHandoff()) return;
+    if (!state.settings.enabled) return;
+    if (location.pathname === '/verify-email') { state.authRequired = true; return; }
+    // Once we have actually left the public login page, the post-login guard has
+    // served its purpose. Remove it immediately rather than leaving it around.
+    if (!isLoginPage()) {
+      try { sessionStorage.removeItem(LOGIN_SUCCESS_GUARD_KEY); } catch {}
+    }
+
+    let recovery = loadLoginRecovery() || sanitiseLoginRecovery(state.loginRecovery);
+    if (!recovery && isLoginPage()) recovery = adoptLoginHandoff();
+
+    // A successful direct login clears recovery before navigation leaves '/'.
+    // During that tiny gap, do NOT interpret the root page as a fresh logout.
+    const loginSuccessPendingNavigation = !recovery && isLoginPage() && loginSuccessGuardActive();
+
+    // If the actual bot tab is already sitting on the root login page (for example
+    // after a browser/page reload with an expired session), arm recovery locally —
+    // but only when we are not in the post-login navigation grace window above.
+    if (!recovery && !loginSuccessPendingNavigation && isLoginPage() && state.settings.enabled && state.botTab && !state.stoppedForDeath) {
+      recovery = saveLoginRecovery('/home');
+      state.currentAction = 'Login recovery armed on existing bot login page';
+      log('Login recovery armed on the current bot login page', 'info');
+    }
+
+    state.loginRecovery = recovery;
+    state.loginCredentials = loadLoginCredentials();
+
+    if (!recovery) {
+      if (loginSuccessPendingNavigation) {
+        state.authRequired = false;
+        state.currentAction = 'Login restored — opening game';
+        return;
+      }
+      if (state.authRequired) {
+        state.authRequired = false;
+        requestSchedulerWake();
+        render();
+      }
+      return;
+    }
+
+    state.authRequired = true;
+    const submittedAt = Number(recovery.submittedAt) || 0;
+
+    if (isLoginPage()) {
+      prepareLoginFormForRecovery();
+      if (!recovery.attemptBlocked && submittedAt <= 0 && state.loginCredentials.autoLogin && hasSavedLoginCredentials()) {
+        void submitSavedLoginOnce(recovery);
+      }
+      return;
+    }
+
+    if (submittedAt > 0) {
+      void probeLoginRecovery(recovery);
+      return;
+    }
+
+    state.currentAction = recovery.attemptBlocked
+      ? 'Auto-login stopped — check Login tab or log in manually'
+      : 'Login required — opening login';
+    ensureLoginRecoveryPage(recovery);
+  }
+
+  function startLoginRecoveryWatcher() {
+    if (loginRecoveryTimer !== null) return;
+    loginRecoveryTick();
+    loginRecoveryTimer = setInterval(loginRecoveryTick, 500);
   }
 
   function sanitiseSettings(value) {
@@ -355,7 +1551,12 @@
 
   function saveSettings(patch) {
     const wasStoppedForDeath = state.stoppedForDeath;
-    if (patch.enabled === false) state.generation += 1;
+    if (patch.enabled === false) {
+      state.generation += 1;
+      clearLoginRecovery();
+      cancelRestart();
+    }
+    if (patch.enabled === true && wasStoppedForDeath && state.restart.enabled && armRestart()) return;
     state.settings = sanitiseSettings({ ...state.settings, ...patch });
     GM_setValue(SETTINGS_KEY, state.settings);
     if (patch.enabled === true) {
@@ -440,6 +1641,7 @@
   }
 
   function stopAutomationForDeath() {
+    const shouldRestart = state.restart.enabled && state.botTab && (state.settings.enabled || state.restartProgress.active);
     state.generation += 1;
     state.stoppedForDeath = true;
     state.inJail = false;
@@ -467,6 +1669,7 @@
     GM_setValue(DEATH_STOP_KEY, true);
     GM_setValue(SETTINGS_KEY, state.settings);
     log('Character is dead — automation stopped; saved modules will be rechecked after Restart bot', 'error');
+    if (shouldRestart && !state.restartProgress.active) armRestart();
   }
 
   function refillRequestTokens(now = Date.now()) {
@@ -538,6 +1741,8 @@
     if (route === '/api/kill/search') return 'search';
     if (/^\/api\/crimes\//.test(route)) return 'crime';
     if (/^\/api\/gta\//.test(route)) return 'gta';
+    if (route === '/api/qt/accept' || route === '/api/qt/perks/buy') return 'quicktrade';
+    if (route === '/api/retrieve/all') return 'retrieve';
     return `POST ${route.replace(/\/bust\/[^/]+$/, '/bust')}`;
   }
 
@@ -577,7 +1782,10 @@
     );
     const rateKey = requestRateKey(path, method);
     const validate = () => {
-      if (!actionAllowed() || state.authRequired || generation !== state.generation) throw new ActionCancelledError('Automation is stopped');
+      const allowed = options.restartFlow === true
+        ? restartAllowed() && ['/api/auth/me', '/api/auth/login', '/api/death/status', '/api/death/restart', '/api/retrieve', '/api/retrieve/all'].includes(path)
+        : actionAllowed() && !state.authRequired;
+      if (!allowed || generation !== state.generation) throw new ActionCancelledError('Automation is stopped');
       if (options.validate) options.validate();
     };
     await reserveRequestSlot(priority, rateKey, validate);
@@ -587,7 +1795,9 @@
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
     let response;
     let body;
+    state.apiInFlight += 1;
     try {
+      if (options.onDispatch) options.onDispatch();
       response = await fetch(new URL(path, location.origin), {
         method,
         credentials: 'include',
@@ -611,6 +1821,7 @@
       throw error;
     } finally {
       clearTimeout(timeout);
+      state.apiInFlight -= 1;
     }
 
     if (!response.ok) {
@@ -635,7 +1846,7 @@
   }
 
   function actionAllowed() {
-    return state.botTab && state.controller && state.settings.enabled && !state.stoppedForDeath;
+    return state.botTab && state.controller && state.settings.enabled && !state.stoppedForDeath && !state.restartProgress.active;
   }
 
   async function queueAction(path, label, options = {}) {
@@ -662,6 +1873,7 @@
     };
     const execute = async () => {
       validate();
+      if (options.beforeSend) { await options.beforeSend(); validate(); }
 
       state.currentAction = label;
       render();
@@ -672,6 +1884,7 @@
         timeoutMs: options.timeoutMs,
         priority: options.priority,
         validate,
+        onDispatch: options.onDispatch,
       });
       const message = cleanMessage(result.html) || label;
       log(message, result.success === false ? 'warn' : 'ok');
@@ -2000,9 +3213,7 @@
       return;
     }
     if (error instanceof ApiError && error.status === 401) {
-      state.authRequired = true;
-      state.currentAction = 'Log in to Underworld Legacy';
-      render();
+      beginLoginRecovery();
       return;
     }
     if (error instanceof ApiError && error.body && error.body.inJail === true) {
@@ -2013,10 +3224,21 @@
   }
 
   function refreshIdleStatus() {
-    if (state.stoppedForDeath) state.currentAction = 'Character dead — stopped';
+    if (state.restartProgress.active) state.currentAction = state.restartProgress.message || 'Restart in progress';
+    else if (state.stoppedForDeath) state.currentAction = 'Character dead — stopped';
     else if (!state.botTab) state.currentAction = 'Play tab — automation inactive';
     else if (!state.settings.enabled) state.currentAction = 'Stopped';
-    else if (state.authRequired) state.currentAction = 'Log in to Underworld Legacy';
+    else if (state.authRequired) {
+      const preserveLoginError = /^(?:Auto-login failed|Auto-login rate-limited|Auto-login request failed|Email verification required)/.test(state.currentAction);
+      if (!preserveLoginError) {
+        const savedAutoLogin = state.loginCredentials.autoLogin && hasSavedLoginCredentials();
+        state.currentAction = state.loginRecovery
+          ? (isLoginPage()
+            ? (savedAutoLogin ? 'Login required — automatic recovery active' : 'Login required — check Login tab or log in manually')
+            : 'Login required — opening login')
+          : 'Log in to Underworld Legacy';
+      }
+    }
     else if (!state.controller) state.currentAction = 'Standby — another tab is active';
     else if (state.inJail) state.currentAction = 'Paused while in jail';
     else if (autoRankIsActiveNow() && !state.jailBustRunning && !state.drugsRunning && !state.playerSearchRunning && !state.combatRunning) state.currentAction = 'Auto Rank active — server-controlled actions paused locally';
@@ -2053,6 +3275,7 @@
     add(!state.inJail && state.settings.drugs && ((!beam && !state.combatRunning) || !state.drugContextLoaded), state.drugsRunning, state.drugsDueAt, runDrugs);
     add(state.settings.discoverPlayers, state.playerDiscoveryRunning, state.playerDiscoveryDueAt, runPlayerDiscovery);
     add(state.settings.discoverPlayers, state.gangDiscoveryRunning, state.gangDiscoveryDueAt, discoverGangPlayers);
+    add(!state.inJail && qtReady(), state.qtRunning, state.qtDueAt, runQuicktrade);
     return tasks;
   }
 
@@ -2132,10 +3355,20 @@
           <div id="ul-simple-status">Loading…</div>
           <button type="button" id="ul-simple-toggle">Start</button>
         </div>
+        <div id="ul-simple-login-recovery" hidden>
+          <div id="ul-simple-login-recovery-text">Login required. Check the Login tab or log in manually.</div>
+          <div class="ul-simple-login-actions">
+            <button type="button" id="ul-simple-open-login-tab">Login settings</button>
+            <button type="button" id="ul-simple-cancel-login">Stop bot</button>
+          </div>
+        </div>
         <nav class="ul-simple-tabs" role="tablist" aria-label="Bot sections">
           <button type="button" class="ul-simple-tab" data-tab="actions" role="tab">Actions</button>
           <button type="button" class="ul-simple-tab" data-tab="cars" role="tab">Cars</button>
           <button type="button" class="ul-simple-tab" data-tab="players" role="tab">Players</button>
+          <button type="button" class="ul-simple-tab" data-tab="quicktrade" role="tab">Quicktrade</button>
+          <button type="button" class="ul-simple-tab" data-tab="restart" role="tab">Restart</button>
+          <button type="button" class="ul-simple-tab" data-tab="login" role="tab">Login</button>
           <button type="button" class="ul-simple-tab" data-tab="logs" role="tab">Logs</button>
         </nav>
 
@@ -2205,6 +3438,76 @@
           <div id="ul-simple-player-actions"></div>
         </section>
 
+        <section class="ul-simple-tab-panel" data-tab-panel="quicktrade" role="tabpanel" hidden>
+          <div class="ul-simple-section-title">Buy points</div>
+          <label><input type="checkbox" id="ul-simple-qt-points"> Enable points purchasing</label>
+          <label class="ul-simple-qt-label">Maximum cash per point
+            <input id="ul-simple-qt-point-price" type="text" inputmode="numeric" placeholder="e.g. 1,000,000">
+          </label>
+          <label class="ul-simple-qt-label">Points still to buy
+            <input id="ul-simple-qt-point-quantity" type="text" inputmode="numeric" placeholder="e.g. 1,000">
+          </label>
+          <button type="button" id="ul-simple-qt-save-points">Save points limits</button>
+          <div id="ul-simple-qt-point-summary" class="ul-simple-qt-note"></div>
+          <div class="ul-simple-qt-note">Buys whole offer lots at or below your price. Lots larger than the remaining quantity are skipped. Zero remaining stops buying. Automatically withdraws only the cash shortfall from Swiss.</div>
+          <div class="ul-simple-section-title">Buy perks</div>
+          <label><input type="checkbox" id="ul-simple-qt-perks"> Enable perk purchasing</label>
+          <button type="button" id="ul-simple-qt-refresh">Load perk names</button>
+          <label class="ul-simple-qt-label">Exact perk name
+            <input id="ul-simple-qt-perk-name" list="ul-simple-qt-catalog" type="text" placeholder="Select or type a full perk name" maxlength="250">
+          </label>
+          <datalist id="ul-simple-qt-catalog"></datalist>
+          <label class="ul-simple-qt-label">Pay with
+            <select id="ul-simple-qt-currency"><option value="money">Cash</option><option value="points">Points</option></select>
+          </label>
+          <label class="ul-simple-qt-label">Maximum price for one whole perk listing
+            <input id="ul-simple-qt-perk-price" type="text" inputmode="numeric" placeholder="Whole listing price">
+          </label>
+          <label class="ul-simple-qt-label">Number of listings still to buy
+            <input id="ul-simple-qt-perk-quantity" type="text" inputmode="numeric" value="1">
+          </label>
+          <button type="button" id="ul-simple-qt-save-rule">Save perk rule</button>
+          <div id="ul-simple-qt-rules"></div>
+          <div class="ul-simple-qt-note">Perk rules match the exact name, including its amount. Prices are per listing, not per minute. Cash purchases automatically withdraw only the shortfall from Swiss. Perks priced in points use your points balance. Consumables and car perks are included.</div>
+          <div class="ul-simple-qt-note">Listings are rechecked before buying. The game cannot lock a perk's quoted price against a last-moment seller change.</div>
+          <div id="ul-simple-qt-status" role="status"></div>
+          <button type="button" id="ul-simple-qt-clear-pending" hidden>I've checked the transaction — resume Quicktrade</button>
+        </section>
+
+        <section class="ul-simple-tab-panel" data-tab-panel="restart" role="tabpanel" hidden>
+          <div class="ul-simple-section-title">Restart after death</div>
+          <label class="ul-simple-restart-option"><input type="checkbox" id="ul-simple-restart-enabled"> Automatically create my next character</label>
+          <label class="ul-simple-restart-option"><input type="checkbox" id="ul-simple-restart-retrieve"> Retrieve archived Swiss, points and eligible cars</label>
+          <div class="ul-simple-restart-note">Uses your existing account. Save your email/password and enable Auto-login in the Login tab if you want it to log in when needed. Normal retrieval tax and car fees apply; staff roles are not retrieved.</div>
+          <label class="ul-simple-restart-option" for="ul-simple-restart-names">Username queue — one name per line</label>
+          <textarea id="ul-simple-restart-names" rows="7" spellcheck="false" placeholder="YourNextName&#10;AnotherName"></textarea>
+          <div class="ul-simple-restart-buttons">
+            <button type="button" id="ul-simple-restart-generate">Generate 100 usernames</button>
+            <button type="button" id="ul-simple-restart-save">Save username list</button>
+          </div>
+          <div class="ul-simple-restart-note">Names are used from the top. Taken names are skipped. Generate adds suggestions to this editable list; save it when ready. Names need 2–20 letters, numbers, spaces, underscores or hyphens.</div>
+          <div id="ul-simple-restart-status" role="status"></div>
+          <button type="button" id="ul-simple-restart-retry">Retry after checking</button>
+        </section>
+
+        <section class="ul-simple-tab-panel" data-tab-panel="login" role="tabpanel" hidden>
+          <div class="ul-simple-section-title">Automatic login</div>
+          <div class="ul-simple-login-note">
+            Saved only in this userscript's Tampermonkey storage on this browser profile. It is not the Chrome/Firefox password vault, so anyone with access to this browser profile/userscript storage may be able to read it. The password is never written into the script source, logs, URLs, page storage or the bot's normal settings.
+          </div>
+          <label class="ul-simple-login-label" for="ul-simple-login-email">Email</label>
+          <input id="ul-simple-login-email" class="ul-simple-login-input" type="email" autocomplete="off" spellcheck="false" placeholder="you@example.com">
+          <label class="ul-simple-login-label" for="ul-simple-login-password">Password</label>
+          <input id="ul-simple-login-password" class="ul-simple-login-input" type="password" autocomplete="off" placeholder="Enter password to save/change">
+          <label class="ul-simple-login-auto"><input type="checkbox" id="ul-simple-login-auto"> Auto-login when the session expires</label>
+          <div class="ul-simple-login-settings-actions">
+            <button type="button" id="ul-simple-login-save">Save locally</button>
+            <button type="button" id="ul-simple-login-clear">Clear saved login</button>
+            <button type="button" id="ul-simple-login-retry">Retry now</button>
+          </div>
+          <div id="ul-simple-login-status">No login saved</div>
+        </section>
+
         <section class="ul-simple-tab-panel" data-tab-panel="logs" role="tabpanel" hidden>
           <div class="ul-simple-section-title">Timing</div>
           <div class="ul-simple-pacing">
@@ -2232,7 +3535,9 @@
       #ul-simple-bot #ul-simple-body { padding:0; }
       #ul-simple-bot .ul-simple-runtime-row { display:grid; grid-template-columns:1fr auto; gap:8px; align-items:center; min-height:43px; padding:7px 8px; }
       #ul-simple-bot #ul-simple-status { color:#ffd36b; }
-      #ul-simple-bot .ul-simple-tabs { display:grid; grid-template-columns:repeat(4,1fr); border-top:1px solid #3b3b3b; border-bottom:1px solid #3b3b3b; background:#181818; }
+      #ul-simple-bot #ul-simple-login-recovery { margin:0 8px 8px; padding:7px; border:1px solid #5b4b2c; background:#211c12; color:#ffdca0; }
+      #ul-simple-bot .ul-simple-login-actions { display:flex; gap:6px; margin-top:6px; }
+      #ul-simple-bot .ul-simple-tabs { display:grid; grid-template-columns:repeat(3,1fr); border-top:1px solid #3b3b3b; border-bottom:1px solid #3b3b3b; background:#181818; }
       #ul-simple-bot .ul-simple-tab { min-width:0; padding:6px 2px; border:0; border-right:1px solid #3b3b3b; font-size:11px; }
       #ul-simple-bot .ul-simple-tab:last-child { border-right:0; }
       #ul-simple-bot .ul-simple-tab.active { color:#a9dcff; background:#303030; box-shadow:inset 0 -2px #69a9d2; }
@@ -2271,7 +3576,27 @@
       #ul-simple-bot .ul-simple-player-action-name small { display:block; color:#888; }
       #ul-simple-bot .ul-simple-player-action-row input { justify-self:center; }
       #ul-simple-bot .ul-simple-player-mode { width:54px; font-size:10px; }
+      #ul-simple-bot .ul-simple-login-note { margin-bottom:8px; padding:6px; border:1px solid #3a4c5d; background:#111a22; color:#b9cedd; }
+      #ul-simple-bot .ul-simple-login-label { display:block; margin:6px 0 3px; color:#bbb; }
+      #ul-simple-bot .ul-simple-login-input { display:block; width:100%; padding:5px; color:#eee; background:#0d0d0d; border:1px solid #555; }
+      #ul-simple-bot .ul-simple-login-auto { display:flex; gap:5px; align-items:center; margin:8px 0; color:#ddd; }
+      #ul-simple-bot .ul-simple-login-settings-actions { display:flex; flex-wrap:wrap; gap:5px; margin-bottom:7px; }
+      #ul-simple-bot #ul-simple-login-status { padding:5px; border:1px solid #333; background:#171717; color:#9fd5ff; }
       #ul-simple-bot .ul-simple-pacing { color:#bbb; margin-bottom:12px; }
+      #ul-simple-bot [data-tab-panel="quicktrade"] { max-height:min(500px,65vh); overflow-y:auto; }
+      #ul-simple-bot [data-tab-panel="restart"] { max-height:min(500px,65vh); overflow-y:auto; }
+      #ul-simple-bot .ul-simple-restart-option { display:block; margin:7px 0; }
+      #ul-simple-bot .ul-simple-restart-note { color:#bbb; font-size:11px; line-height:1.4; margin:7px 0; }
+      #ul-simple-bot #ul-simple-restart-names { box-sizing:border-box; width:100%; color:#eee; background:#181818; border:1px solid #555; resize:vertical; }
+      #ul-simple-bot .ul-simple-restart-buttons { display:flex; flex-wrap:wrap; gap:5px; }
+      #ul-simple-bot #ul-simple-restart-status { margin:7px 0; overflow-wrap:anywhere; }
+      #ul-simple-bot .ul-simple-qt-label { display:block; margin:6px 0; color:#bbb; }
+      #ul-simple-bot .ul-simple-qt-label input, #ul-simple-bot .ul-simple-qt-label select { display:block; width:100%; box-sizing:border-box; padding:5px; color:#eee; background:#0d0d0d; border:1px solid #555; }
+      #ul-simple-bot .ul-simple-qt-note { color:#aaa; font-size:11px; margin:7px 0; }
+      #ul-simple-bot .ul-simple-qt-rule { padding:7px 0; border-bottom:1px solid #444; overflow-wrap:anywhere; }
+      #ul-simple-bot .ul-simple-qt-rule small { display:block; margin:4px 0; }
+      #ul-simple-bot .ul-simple-qt-rule button { margin-right:5px; }
+      #ul-simple-bot #ul-simple-qt-status { color:#ffd36b; margin:8px 0; overflow-wrap:anywhere; }
       #ul-simple-bot #ul-simple-last { padding:6px; background:#191919; border:1px solid #333; color:#ddd; }
       #ul-simple-bot #ul-simple-logs { max-height:86px; overflow:auto; margin-top:5px; color:#aaa; }
       #ul-simple-bot .ul-simple-log { padding:2px 0; border-bottom:1px dotted #333; }
@@ -2302,18 +3627,28 @@
     const tabMode = host.querySelector('#ul-simple-tab-mode');
     const collapse = host.querySelector('#ul-simple-collapse');
     const body = host.querySelector('#ul-simple-body');
+    const openLoginTab = host.querySelector('#ul-simple-open-login-tab');
+    const loginEmail = host.querySelector('#ul-simple-login-email');
+    const loginPassword = host.querySelector('#ul-simple-login-password');
+    const loginAuto = host.querySelector('#ul-simple-login-auto');
+    const loginSave = host.querySelector('#ul-simple-login-save');
+    const loginClear = host.querySelector('#ul-simple-login-clear');
+    const loginRetry = host.querySelector('#ul-simple-login-retry');
+    const cancelLogin = host.querySelector('#ul-simple-cancel-login');
 
     for (const tab of host.querySelectorAll('.ul-simple-tab')) {
       tab.addEventListener('click', () => {
         const nextTab = String(tab.dataset.tab || '');
-        if (!['actions', 'cars', 'players', 'logs'].includes(nextTab)) return;
+        if (!['actions', 'cars', 'players', 'quicktrade', 'restart', 'login', 'logs'].includes(nextTab)) return;
         state.uiTab = nextTab;
         sessionStorage.setItem(UI_TAB_KEY, nextTab);
         render();
       });
     }
 
-    toggle.addEventListener('click', () => saveSettings({ enabled: !state.settings.enabled }));
+    bindQuicktradePanel(host);
+    bindRestartPanel(host);
+    toggle.addEventListener('click', () => saveSettings({ enabled: state.restartProgress.active ? false : !state.settings.enabled }));
     crimes.addEventListener('change', () => {
       saveSettings({ crimes: crimes.checked });
       state.crimesDueAt = 0;
@@ -2407,6 +3742,54 @@
       state.drugsDueAt = 0;
     });
     tabMode.addEventListener('click', () => setBotTab(!state.botTab));
+    openLoginTab.addEventListener('click', () => {
+      state.uiTab = 'login';
+      sessionStorage.setItem(UI_TAB_KEY, 'login');
+      render();
+      loginEmail.focus();
+    });
+    loginSave.addEventListener('click', () => {
+      const emailValue = String(loginEmail.value || '').trim();
+      const enteredPassword = String(loginPassword.value || '');
+      const current = loadLoginCredentials();
+      const sameEmail = current.email && current.email.toLocaleLowerCase() === emailValue.toLocaleLowerCase();
+      const passwordValue = enteredPassword || (sameEmail ? current.password : '');
+      if (!emailValue || !passwordValue) {
+        state.loginCredentialStatus = emailValue
+          ? 'Enter the password before saving this email'
+          : 'Enter an email and password';
+        render();
+        return;
+      }
+      saveLocalLoginCredentials(emailValue, passwordValue, loginAuto.checked);
+      loginPassword.value = '';
+      if (state.authRequired && loginAuto.checked) {
+        const recovery = loadLoginRecovery() || state.loginRecovery || saveLoginRecovery('/home');
+        const next = updateLoginRecovery({ submittedAt: 0, attemptBlocked: false }) || recovery;
+        if (isLoginPage()) void submitSavedLoginOnce(next);
+        else ensureLoginRecoveryPage(next);
+      }
+      render();
+    });
+    loginClear.addEventListener('click', () => {
+      clearLocalLoginCredentials();
+      loginEmail.value = '';
+      loginPassword.value = '';
+      render();
+    });
+    loginRetry.addEventListener('click', () => {
+      if (!retrySavedLogin()) {
+        state.loginCredentialStatus = state.authRequired
+          ? 'Save a login and enable Auto-login first'
+          : 'Retry is only available while login is required';
+        render();
+      }
+    });
+    cancelLogin.addEventListener('click', () => {
+      saveSettings({ enabled: false });
+      state.currentAction = 'Stopped';
+      render();
+    });
     collapse.addEventListener('click', () => {
       const hidden = body.hidden;
       body.hidden = !hidden;
@@ -2419,9 +3802,31 @@
   function render() {
     const host = document.querySelector('#ul-simple-bot');
     if (!host) return;
+    renderQuicktradePanel(host);
+    renderRestartPanel(host);
 
     const toggle = host.querySelector('#ul-simple-toggle');
-    toggle.textContent = state.stoppedForDeath ? 'Restart bot' : state.settings.enabled ? 'Stop' : 'Start';
+    const loginRecovery = host.querySelector('#ul-simple-login-recovery');
+    loginRecovery.hidden = !(state.authRequired && state.loginRecovery && isLoginPage());
+    const loginRecoveryText = host.querySelector('#ul-simple-login-recovery-text');
+    if (loginRecoveryText) {
+      loginRecoveryText.textContent = state.loginCredentials.autoLogin && hasSavedLoginCredentials()
+        ? 'Automatic login is configured. If it did not succeed, check the Login tab to update the saved details or retry.'
+        : 'Login required. Save credentials in the Login tab for automatic recovery, or use the normal game login form manually.';
+    }
+    const loginEmail = host.querySelector('#ul-simple-login-email');
+    const loginPassword = host.querySelector('#ul-simple-login-password');
+    const loginAuto = host.querySelector('#ul-simple-login-auto');
+    const loginStatus = host.querySelector('#ul-simple-login-status');
+    if (document.activeElement !== loginEmail) loginEmail.value = state.loginCredentials.email || '';
+    loginPassword.placeholder = state.loginCredentials.password ? 'Saved locally — enter a new password to change it' : 'Enter password to save/change';
+    loginAuto.checked = state.loginCredentials.autoLogin === true;
+    loginStatus.textContent = state.loginCredentialStatus || (hasSavedLoginCredentials()
+      ? `${state.loginCredentials.autoLogin ? 'Auto-login enabled' : 'Login saved; auto-login disabled'} · password stored locally in Tampermonkey`
+      : 'No login saved');
+    const loginRetryBlockedUntil = Number(state.loginRecovery && state.loginRecovery.retryAfterUntil) || 0;
+    host.querySelector('#ul-simple-login-retry').disabled = !(state.authRequired && state.loginCredentials.autoLogin && hasSavedLoginCredentials()) || loginRetryBlockedUntil > Date.now();
+    toggle.textContent = state.restartProgress.active ? 'Stop' : state.stoppedForDeath ? 'Restart bot' : state.settings.enabled ? 'Stop' : 'Start';
     toggle.title = state.stoppedForDeath
       ? 'After restarting your character, press here to recheck and resume the saved modules'
       : '';
@@ -2475,6 +3880,13 @@
     for (const control of host.querySelectorAll('#ul-simple-body button:not(.ul-simple-tab), #ul-simple-body input, #ul-simple-body textarea, #ul-simple-body select')) {
       control.disabled = !state.botTab;
     }
+    host.querySelector('#ul-simple-login-retry').disabled = !state.botTab
+      || !(state.authRequired && state.loginCredentials.autoLogin && hasSavedLoginCredentials())
+      || loginRetryBlockedUntil > Date.now();
+    host.querySelector('#ul-simple-qt-clear-pending').disabled = !state.botTab || state.qtRunning || !state.qt.pending;
+    host.querySelector('#ul-simple-qt-refresh').disabled = !state.botTab || state.qtCatalogRunning;
+    host.querySelector('#ul-simple-restart-retry').disabled = !state.botTab || !state.restart.enabled || state.restartRunning
+      || !(state.restartProgress.active || state.stoppedForDeath || state.restartProgress.pending);
     for (const id of [
       '#ul-simple-crimes',
       '#ul-simple-gta',
@@ -2509,6 +3921,139 @@
       line.textContent = `${new Date(row.at).toLocaleTimeString('en-GB')} · ${row.text}`;
       logs.appendChild(line);
     }
+  }
+
+  function bindRestartPanel(host) {
+    const get = (name) => host.querySelector(`#ul-simple-restart-${name}`);
+    get('names').addEventListener('input', () => { get('names').dataset.dirty = 'true'; });
+    get('enabled').addEventListener('change', () => {
+      saveRestart({ enabled: get('enabled').checked });
+      if (state.restart.enabled && state.stoppedForDeath && !state.restartProgress.active) armRestart();
+      restartTick();
+    });
+    get('retrieve').addEventListener('change', () => { saveRestart({ retrieveAssets: get('retrieve').checked }); restartTick(); });
+    get('generate').addEventListener('click', () => {
+      const existing = get('names').value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+      const count = Math.min(100, Math.max(0, 1000 - existing.length));
+      get('names').value = [...existing, ...generateRestartNames(existing, count)].join('\n');
+      get('names').dataset.dirty = 'true';
+      get('status').textContent = `Added ${count} suggestions. Edit if you wish, then save the list.`;
+    });
+    get('save').addEventListener('click', () => {
+      const usernames = get('names').value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+      const bad = usernames.find((name) => !validRestartName(name));
+      if (bad || usernames.length > 1000) {
+        get('status').textContent = bad ? `Invalid username: ${bad}. Use 2–20 allowed characters.` : 'Maximum 1,000 usernames.';
+        return;
+      }
+      get('names').dataset.dirty = '';
+      saveRestart({ usernames }); restartTick();
+    });
+    get('retry').addEventListener('click', retryRestart);
+  }
+
+  function renderRestartPanel(host) {
+    const get = (name) => host.querySelector(`#ul-simple-restart-${name}`);
+    get('enabled').checked = state.restart.enabled;
+    get('retrieve').checked = state.restart.retrieveAssets;
+    if (get('names').dataset.dirty !== 'true' && document.activeElement !== get('names')) get('names').value = state.restart.usernames.join('\n');
+    const p = state.restartProgress;
+    get('status').textContent = p.active ? p.message || 'Checking restart'
+      : `${state.restart.enabled ? 'Automatic restart enabled' : 'Automatic restart disabled'} · ${state.restart.usernames.length} names saved${p.message ? ` · ${p.message}` : ''}`;
+  }
+
+  function bindQuicktradePanel(host) {
+    const get = (name) => host.querySelector(`#ul-simple-qt-${name}`);
+    for (const name of ['point-price', 'point-quantity']) {
+      get(name).addEventListener('input', () => { get(name).dataset.dirty = 'true'; });
+    }
+    get('points').addEventListener('change', () => saveQuicktrade({ pointsEnabled: get('points').checked }));
+    get('perks').addEventListener('change', () => saveQuicktrade({ perksEnabled: get('perks').checked }));
+    get('refresh').addEventListener('click', () => { void refreshQtCatalog(); });
+    get('save-points').addEventListener('click', () => {
+      const price = qtInteger(get('point-price').value);
+      const quantity = qtInteger(get('point-quantity').value);
+      if (price === '0' || (quantity === '0' && get('point-quantity').value.trim() !== '0')) {
+        state.qtStatus = 'Enter a positive whole cash price and a whole quantity (0 stops purchases). Commas are allowed.';
+        render(); return;
+      }
+      get('point-price').dataset.dirty = '';
+      get('point-quantity').dataset.dirty = '';
+      state.qtStatus = 'Points limits saved';
+      saveQuicktrade({ pointsMaxPrice: price, pointsRemaining: quantity }, 'points');
+    });
+    get('save-rule').addEventListener('click', () => {
+      const label = get('perk-name').value.trim();
+      const currency = get('currency').value;
+      const price = qtInteger(get('perk-price').value);
+      const quantity = qtInteger(get('perk-quantity').value);
+      if (!label || price === '0' || quantity === '0' || !['money', 'points'].includes(currency)) {
+        state.qtStatus = 'Enter an exact perk name, a positive whole listing price and a positive quantity.';
+        render(); return;
+      }
+      const existing = state.qt.rules.find((r) => r.label === label && r.currency === currency);
+      if (!existing && state.qt.rules.length >= 100) {
+        state.qtStatus = 'Remove an old rule before adding more (100 maximum).'; render(); return;
+      }
+      const rule = { id: existing?.id || `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        label, currency, maxPrice: price, remaining: quantity, enabled: true };
+      const rules = existing ? state.qt.rules.map((r) => r.id === existing.id ? rule : r) : [...state.qt.rules, rule];
+      state.qtStatus = 'Perk rule saved';
+      saveQuicktrade({ rules }, rule.id);
+    });
+    get('clear-pending').addEventListener('click', () => {
+      if (state.qtRunning) return;
+      state.qtStatus = state.qt.pending?.kind === 'swiss'
+        ? 'Quicktrade resumed. Cash/Swiss balances will be read again; no purchase quantity was deducted.'
+        : 'Quicktrade resumed. Reserved quantity remains deducted; adjust it if the purchase failed.';
+      saveQuicktrade({ pending: null });
+    });
+  }
+
+  function renderQuicktradePanel(host) {
+    const get = (name) => host.querySelector(`#ul-simple-qt-${name}`);
+    get('points').checked = state.qt.pointsEnabled;
+    get('perks').checked = state.qt.perksEnabled;
+    for (const [name, value] of [['point-price', state.qt.pointsMaxPrice], ['point-quantity', state.qt.pointsRemaining]]) {
+      if (get(name).dataset.dirty !== 'true' && document.activeElement !== get(name)) get(name).value = value;
+    }
+    get('point-summary').textContent = `Saved: up to $${BigInt(state.qt.pointsMaxPrice).toLocaleString('en-GB')}/point · ${BigInt(state.qt.pointsRemaining).toLocaleString('en-GB')} points remaining`;
+    const catalog = [...new Set([...state.qtCatalog, ...state.qt.rules.map((r) => r.label)])];
+    const catalogSignature = JSON.stringify(catalog);
+    if (get('catalog').dataset.signature !== catalogSignature) {
+      get('catalog').replaceChildren(...catalog.map((label) => {
+        const option = document.createElement('option'); option.value = label; return option;
+      }));
+      get('catalog').dataset.signature = catalogSignature;
+    }
+    const rulesSignature = JSON.stringify(state.qt.rules);
+    if (get('rules').dataset.signature !== rulesSignature) {
+      get('rules').replaceChildren(...state.qt.rules.map((rule) => {
+        const row = document.createElement('div'); row.className = 'ul-simple-qt-rule';
+        const label = document.createElement('label');
+        const toggle = document.createElement('input'); toggle.type = 'checkbox'; toggle.checked = rule.enabled;
+        toggle.addEventListener('change', () => saveQuicktrade({ rules: state.qt.rules.map((r) => r.id === rule.id ? { ...r, enabled: toggle.checked } : r) }));
+        label.append(toggle, ` ${rule.label}`);
+        const details = document.createElement('small');
+        details.textContent = `${rule.currency === 'money' ? '$' : ''}${BigInt(rule.maxPrice).toLocaleString('en-GB')}${rule.currency === 'points' ? ' points' : ''} max/listing · ${rule.remaining} remaining`;
+        const edit = document.createElement('button'); edit.type = 'button'; edit.textContent = 'Edit';
+        edit.addEventListener('click', () => {
+          get('perk-name').value = rule.label; get('currency').value = rule.currency;
+          get('perk-price').value = rule.maxPrice; get('perk-quantity').value = rule.remaining;
+          get('perk-price').focus();
+        });
+        const remove = document.createElement('button'); remove.type = 'button'; remove.textContent = 'Remove';
+        remove.addEventListener('click', () => saveQuicktrade({ rules: state.qt.rules.filter((r) => r.id !== rule.id) }));
+        row.append(label, details, edit, remove); return row;
+      }));
+      get('rules').dataset.signature = rulesSignature;
+    }
+    get('status').textContent = state.qt.pending
+      ? (state.qt.pending.kind === 'swiss'
+        ? (state.qtRunning ? 'Withdrawing purchase shortfall from Swiss…' : 'Swiss withdrawal unconfirmed. Check your bank before resuming; no purchase quantity was deducted.')
+        : (state.qtRunning ? 'Purchase in progress…' : 'Purchase unconfirmed. Check your game transactions and remaining quantities before resuming.'))
+      : state.qtStatus;
+    get('clear-pending').hidden = !state.qt.pending || state.qtRunning;
   }
 
   function renderPlayerActions(container) {
@@ -2597,9 +4142,10 @@
   }
 
   function setBotTab(enabled) {
-    if (!enabled) state.generation += 1;
+    if (!enabled) { state.generation += 1; clearLoginRecovery(); cancelRestart(); }
     state.botTab = enabled;
     sessionStorage.setItem(BOT_TAB_KEY, enabled ? 'true' : 'false');
+    savePerTabState();
     if (enabled) {
       state.currentAction = 'Waiting for controller lock';
       startControllerElection();
@@ -2638,6 +4184,7 @@
           if (!lock) {
             state.botTab = false;
             sessionStorage.setItem(BOT_TAB_KEY, 'false');
+            savePerTabState();
             state.currentAction = 'Play tab — another bot tab is active';
             render();
             return;
@@ -2660,7 +4207,8 @@
     });
   }
 
-  GM_addValueChangeListener(SETTINGS_KEY, (_name, _oldValue, newValue) => {
+  GM_addValueChangeListener(SETTINGS_KEY, (_name, _oldValue, newValue, remote) => {
+    if (!remote) return;
     const nextSettings = sanitiseSettings({ ...DEFAULT_SETTINGS, ...(newValue || {}) });
     const starting = nextSettings.enabled && !state.settings.enabled;
     if (!nextSettings.enabled && state.settings.enabled) state.generation += 1;
@@ -2672,7 +4220,38 @@
     requestSchedulerWake();
   });
 
-  GM_addValueChangeListener(DEATH_STOP_KEY, (_name, _oldValue, newValue) => {
+  GM_addValueChangeListener(QT_KEY, (_name, _oldValue, newValue, remote) => {
+    if (!remote) return;
+    state.qt = sanitiseQuicktrade(newValue);
+    state.qtRevision += 1;
+    state.qtDueAt = 0;
+    render();
+    requestSchedulerWake();
+  });
+
+  GM_addValueChangeListener(RESTART_KEY, (_name, _oldValue, newValue, remote) => {
+    if (!remote) return;
+    state.restart = sanitiseRestart(newValue);
+    state.restartRevision += 1;
+    if (!state.restart.enabled) state.generation += 1;
+    render();
+  });
+
+  GM_addValueChangeListener(RESTART_PROGRESS_KEY, (_name, _oldValue, newValue, remote) => {
+    if (!remote) return;
+    state.restartProgress = sanitiseRestartProgress(newValue);
+    if (!state.restartProgress.active) state.generation += 1;
+    render(); requestSchedulerWake();
+  });
+
+  GM_addValueChangeListener(LOGIN_CREDENTIALS_KEY, (_name, _oldValue, newValue) => {
+    state.loginCredentials = sanitiseLoginCredentials(newValue && typeof newValue === 'object' ? newValue : null);
+    state.loginCredentialStatus = '';
+    render();
+  });
+
+  GM_addValueChangeListener(DEATH_STOP_KEY, (_name, _oldValue, newValue, remote) => {
+    if (!remote) return;
     state.stoppedForDeath = newValue === true;
     if (state.stoppedForDeath) {
       state.generation += 1;
@@ -2702,7 +4281,11 @@
     requestSchedulerWake();
   });
 
-  createPanel();
-  if (state.botTab) startControllerElection();
-  startSchedulerClock();
+  restorePerTabState(() => {
+    createPanel();
+    startLoginRecoveryWatcher();
+    if (state.botTab) startControllerElection();
+    startRestartWatcher();
+    startSchedulerClock();
+  });
 })();
