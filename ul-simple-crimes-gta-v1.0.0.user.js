@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Underworld Legacy - Crimes & GTA
 // @namespace    https://underworldlegacy.com/
-// @version      1.18.0
-// @description  API-first UL automation with Quicktrade, Swiss funding, automatic character restart, username generation, optional asset retrieval and local login recovery.
+// @version      1.19.2
+// @description  API-first UL automation with separate jail refresh/bust limits, sidebar-triggered auto-prestige, jailbot busting, Quicktrade, Swiss funding, character restart and local login recovery.
 // @author       Aphotic
 // @updateURL    https://raw.githubusercontent.com/ssdddssdfswee/UL-Bot/main/ul-simple-crimes-gta-v1.0.0.user.js
 // @downloadURL  https://raw.githubusercontent.com/ssdddssdfswee/UL-Bot/main/ul-simple-crimes-gta-v1.0.0.user.js
@@ -47,11 +47,14 @@
   const LOGIN_RECOVERY_PROBE_MS = 2_000;
   const ONLINE_DISCOVERY_MS = 2 * 60_000;
   const GANG_DISCOVERY_MS = 10 * 60_000;
+  const PRESTIGE_CHECK_MS = 3 * 60_000;
+  const PRESTIGE_HINT_MIN_MS = 10_000;
+  const PRESTIGE_ELIGIBILITY_MAX_AGE_MS = 5_000;
   const PLAYER_SEARCH_MIN_RENEW_LEAD_SECONDS = 30 * 60;
   const PLAYER_SEARCH_RENEW_SAFETY_SECONDS = 120;
   const SHOOT_WINDOW_MS = 10_000;
   const SHOOT_WINDOW_LIMIT = 49;
-  // September 18 game source: separate fixed windows, NOT a combined
+  // October 1 perf-v6.1 source: separate fixed windows, NOT a combined
   // prepare/shoot allowance. Sliding client windows are slightly stricter.
   const ACTION_RATE_LIMITS = Object.freeze({
     shoot: { limit: SHOOT_WINDOW_LIMIT, windowMs: SHOOT_WINDOW_MS },
@@ -59,14 +62,22 @@
     search: { limit: 98, windowMs: 10_000 },
     crime: { limit: 98, windowMs: 10_000 },
     gta: { limit: 98, windowMs: 10_000 },
+    jailBust: { limit: 5, windowMs: 1_000 },
+    // jail.ts also limits GET /api/jail to 120 reads / 10s per player.
+    // Space reads to avoid spending this budget in a burst, leaving headroom
+    // for manual jail refreshes. Bust POSTs keep their independent budget.
+    jailRead: { limit: 110, windowMs: 10_000, minIntervalMs: 92 },
     quicktrade: { limit: 98, windowMs: 10_000 },
     retrieve: { limit: 19, windowMs: 30_000 },
   });
-  // The server refills 20 global request tokens per second with a 100-request
+  // The perf-v6.1 server refills 15 global request tokens per second with a 60-request
   // burst. Keep a little headroom for ordinary play in another tab while still
   // allowing the bot to use accumulated burst capacity.
-  const REQUEST_REFILL_PER_SECOND = 18;
-  const REQUEST_BURST_CAPACITY = 80;
+  const REQUEST_REFILL_PER_SECOND = 13;
+  const REQUEST_BURST_CAPACITY = 48;
+  // Real-player and personal-bot bust POSTs share jailBust's limit instead of
+  // spending global tokens. Jail-list GETs still use the global budget, and
+  // an active server-wide block pauses every lane, including jailbusting.
   const REQUEST_PRIORITY = Object.freeze({ ACTION: 0, RAPID: 1, NORMAL: 2, BACKGROUND: 3 });
   const DRUG_ROUTE = Object.freeze({
     russia: { buy: 'heroin', next: 'usa' },
@@ -100,6 +111,7 @@
     repairBeforeMelt: false,
     drugs: false,
     autoRank: false,
+    autoPrestige: false,
     discoverPlayers: false,
     searchPlayers: false,
     beamTravelMode: 'auto',
@@ -137,6 +149,14 @@
     meltDueAt: 0,
     drugsDueAt: 0,
     autoRankDueAt: 0,
+    prestigeDueAt: Date.now() + PRESTIGE_CHECK_MS,
+    prestigeNextCheckAt: 0,
+    prestigeComplete: false,
+    prestigeRunning: false,
+    prestigeCommitting: false,
+    prestigeRevision: 0,
+    prestigeSidebarPresent: false,
+    prestigeStatus: 'Watching sidebar · fallback check every 3 minutes',
     playerDiscoveryDueAt: 0,
     gangDiscoveryDueAt: 0,
     playerSearchDueAt: 0,
@@ -1400,6 +1420,7 @@
       repairBeforeMelt: value.repairBeforeMelt === true,
       drugs: value.drugs === true,
       autoRank: value.autoRank === true,
+      autoPrestige: value.autoPrestige === true,
       discoverPlayers: value.discoverPlayers === true,
       searchPlayers: value.searchPlayers === true,
       beamTravelMode: ['auto', 'car', 'airport'].includes(value.beamTravelMode) ? value.beamTravelMode : DEFAULT_SETTINGS.beamTravelMode,
@@ -1551,6 +1572,7 @@
 
   function saveSettings(patch) {
     const wasStoppedForDeath = state.stoppedForDeath;
+    const wasAutoPrestige = state.settings.autoPrestige;
     if (patch.enabled === false) {
       state.generation += 1;
       clearLoginRecovery();
@@ -1558,6 +1580,7 @@
     }
     if (patch.enabled === true && wasStoppedForDeath && state.restart.enabled && armRestart()) return;
     state.settings = sanitiseSettings({ ...state.settings, ...patch });
+    syncPrestigeSetting(wasAutoPrestige);
     GM_setValue(SETTINGS_KEY, state.settings);
     if (patch.enabled === true) {
       prepareRuntimeForStart(wasStoppedForDeath);
@@ -1571,6 +1594,7 @@
     GM_setValue(DEATH_STOP_KEY, false);
     state.authRequired = false;
     if (afterDeath) {
+      resetPrestigeState();
       state.inJail = false;
       state.jailMarkedAt = 0;
       state.autoRankActive = false;
@@ -1700,10 +1724,11 @@
       try { if (entry.validate) entry.validate(); return true; }
       catch (error) { entry.reject(error); return false; }
     });
-    while (requestLimiter.tokens >= 1 && requestLimiter.queue.length > 0) {
+    while (requestLimiter.queue.length > 0) {
       let selectedIndex = -1;
       for (let index = 0; index < requestLimiter.queue.length; index += 1) {
         const candidate = requestLimiter.queue[index];
+        if (candidate.usesGlobalToken && requestLimiter.tokens < 1) continue;
         if (requestRateWait(candidate.rateKey, now) > 0) continue;
         const selected = requestLimiter.queue[selectedIndex];
         // Age waiting work to prevent endless rapid scans starving discovery
@@ -1718,7 +1743,7 @@
       }
       if (selectedIndex < 0) break;
       const [next] = requestLimiter.queue.splice(selectedIndex, 1);
-      requestLimiter.tokens -= 1;
+      if (next.usesGlobalToken) requestLimiter.tokens -= 1;
       const bucket = requestBucket(next.rateKey);
       if (bucket && ACTION_RATE_LIMITS[next.rateKey]) bucket.history.push(now);
       next.resolve();
@@ -1727,14 +1752,18 @@
     if (requestLimiter.queue.length > 0 && requestLimiter.timer === null) {
       const missing = Math.max(0, 1 - requestLimiter.tokens);
       const tokenWait = Math.ceil(missing * 1000 / REQUEST_REFILL_PER_SECOND);
-      const featureWait = Math.min(...requestLimiter.queue.map((entry) => requestRateWait(entry.rateKey, now)));
-      const waitMs = Math.max(1, tokenWait, featureWait);
+      const readyWait = Math.min(...requestLimiter.queue.map((entry) => Math.max(
+        entry.usesGlobalToken ? tokenWait : 0,
+        requestRateWait(entry.rateKey, now),
+      )));
+      const waitMs = Math.max(1, readyWait);
       requestLimiter.timer = setTimeout(pumpRequestQueue, waitMs);
     }
   }
 
   function requestRateKey(path, method = 'GET') {
     const route = path.split('?')[0];
+    if (method === 'GET' && /^\/api\/jail\/?$/.test(route)) return 'jailRead';
     if (method !== 'POST') return `GET ${route}`;
     if (route === '/api/kill/shoot') return 'shoot';
     if (route === '/api/kill/prepare') return 'prepare';
@@ -1743,7 +1772,12 @@
     if (/^\/api\/gta\//.test(route)) return 'gta';
     if (route === '/api/qt/accept' || route === '/api/qt/perks/buy') return 'quicktrade';
     if (route === '/api/retrieve/all') return 'retrieve';
-    return `POST ${route.replace(/\/bust\/[^/]+$/, '/bust')}`;
+    if (isJailBustPath(route)) return 'jailBust';
+    return `POST ${route}`;
+  }
+
+  function isJailBustPath(path) {
+    return /^\/api\/jail\/bust(?:-bot)?\/[^/]+$/.test(path);
   }
 
   function requestBucket(key) {
@@ -1759,7 +1793,9 @@
     if (config) bucket.history = bucket.history.filter((at) => at + config.windowMs + 50 > now);
     const windowWait = config && bucket.history.length >= config.limit
       ? bucket.history[bucket.history.length - config.limit] + config.windowMs + 50 - now : 0;
-    return Math.max(0, bucket.blockedUntil - now, windowWait);
+    const spacingWait = config && config.minIntervalMs && bucket.history.length
+      ? bucket.history[bucket.history.length - 1] + config.minIntervalMs - now : 0;
+    return Math.max(0, bucket.blockedUntil - now, windowWait, spacingWait);
   }
 
   function reserveRequestSlot(priority = REQUEST_PRIORITY.NORMAL, rateKey = '', validate = null) {
@@ -1767,7 +1803,7 @@
       requestLimiter.queue.push({
         priority: Number.isFinite(priority) ? priority : REQUEST_PRIORITY.NORMAL,
         sequence: requestLimiter.sequence++,
-        queuedAt: Date.now(), rateKey, validate, reject,
+        queuedAt: Date.now(), rateKey, usesGlobalToken: rateKey !== 'jailBust', validate, reject,
         resolve,
       });
       pumpRequestQueue();
@@ -1865,11 +1901,16 @@
       const enabled = path.startsWith('/api/crimes/') ? state.settings.crimes
         : path === '/api/gta/steal' ? state.settings.gta
         : path.startsWith('/api/melt/') ? state.settings.melt
-        : path.startsWith('/api/jail/bust/') ? state.settings.jailBust
+        : isJailBustPath(path) ? state.settings.jailBust
         : path.startsWith('/api/auto-rank/') ? state.settings.autoRank
+        : path === '/api/prestige/start' ? state.settings.autoPrestige
         : path === '/api/drugs/buy' || path === '/api/drugs/sell' ? state.settings.drugs && !activeBeamName()
         : true;
       if (!enabled) throw new ActionCancelledError('Feature switched off');
+      if (state.prestigeCommitting && (path.startsWith('/api/crimes/')
+        || path === '/api/gta/steal' || path.startsWith('/api/auto-rank/'))) {
+        throw new ActionCancelledError('Prestige transition in progress');
+      }
     };
     const execute = async () => {
       validate();
@@ -1898,7 +1939,7 @@
     // or a purchase. Spending, repairs, travel and shooting remain ordered.
     const lane = path.startsWith('/api/crimes/') ? 'crime'
       : path === '/api/gta/steal' ? 'gta'
-      : path.startsWith('/api/jail/bust/') ? 'jail'
+      : isJailBustPath(path) ? 'jail'
       : path === '/api/kill/search' ? 'search'
       : path.startsWith('/api/auto-rank/') ? 'auto-rank'
       : 'economy';
@@ -2415,6 +2456,156 @@
     }
   }
 
+  function resetPrestigeState() {
+    state.prestigeRevision += 1;
+    state.prestigeComplete = false;
+    state.prestigeDueAt = Date.now() + PRESTIGE_CHECK_MS;
+    state.prestigeNextCheckAt = 0;
+    state.prestigeSidebarPresent = false;
+    state.prestigeStatus = state.settings.autoPrestige
+      ? 'Watching sidebar · fallback check every 3 minutes' : 'Auto-prestige disabled';
+    checkPrestigeSidebar();
+  }
+
+  function syncPrestigeSetting(previous) {
+    if (previous !== state.settings.autoPrestige) resetPrestigeState();
+  }
+
+  function checkPrestigeSidebar() {
+    if (!state.settings.autoPrestige || state.prestigeComplete || !actionAllowed() || state.authRequired) {
+      state.prestigeSidebarPresent = false;
+      return;
+    }
+    // The game's StatsBar renders this button only when stats.canPrestige is
+    // true. Observe its presence, including in a collapsed/background sidebar;
+    // do not click it or navigate away from the bot tab.
+    const present = Boolean(document.querySelector('#player-prestige'));
+    const appeared = present && !state.prestigeSidebarPresent;
+    state.prestigeSidebarPresent = present;
+    if (!appeared) return;
+    const dueAt = Math.min(state.prestigeDueAt, Math.max(Date.now(), state.prestigeNextCheckAt));
+    if (dueAt !== state.prestigeDueAt) {
+      state.prestigeDueAt = dueAt;
+      requestSchedulerWake();
+    }
+  }
+
+  let prestigeSidebarObserver = null;
+  function startPrestigeSidebarWatcher() {
+    if (!prestigeSidebarObserver && typeof MutationObserver === 'function' && document.documentElement) {
+      prestigeSidebarObserver = new MutationObserver(checkPrestigeSidebar);
+      prestigeSidebarObserver.observe(document.documentElement, { childList: true, subtree: true });
+    }
+    checkPrestigeSidebar();
+  }
+
+  function readPrestigeState(data) {
+    if (!data || !Number.isInteger(data.prestigeLevel) || data.prestigeLevel < 0
+      || !Number.isInteger(data.maxPrestigeLevel) || data.maxPrestigeLevel < 1
+      || data.prestigeLevel > data.maxPrestigeLevel || typeof data.canPrestige !== 'boolean'
+      || (data.prestigeLevel < data.maxPrestigeLevel && data.nextPrestigeLevel !== data.prestigeLevel + 1)
+      || (data.prestigeLevel === data.maxPrestigeLevel && (data.canPrestige || data.nextPrestigeLevel !== null))) {
+      throw new Error('Prestige eligibility response could not be verified');
+    }
+    return data;
+  }
+
+  function applyPrestigeState(data) {
+    state.prestigeComplete = data.prestigeLevel === data.maxPrestigeLevel;
+    state.prestigeDueAt = state.prestigeComplete ? Infinity : Date.now() + PRESTIGE_CHECK_MS;
+    state.prestigeStatus = state.prestigeComplete
+      ? 'Final prestige entered — no further prestige checks'
+      : data.canPrestige
+        ? `Eligible for ${data.nextPrestigeLabel || `prestige ${data.nextPrestigeLevel}`}`
+        : `Waiting for ${data.maxRankName || 'the maximum rank'} · watching sidebar; 3-minute fallback`;
+  }
+
+  async function runPrestige() {
+    if (!actionAllowed() || state.authRequired || state.inJail || !state.settings.autoPrestige
+      || state.prestigeRunning || state.prestigeComplete || state.prestigeDueAt > Date.now()) return;
+    state.prestigeRunning = true;
+    const generation = state.generation;
+    const revision = state.prestigeRevision;
+    const validate = () => {
+      if (!actionAllowed() || state.authRequired || state.inJail || !state.settings.autoPrestige
+        || generation !== state.generation || revision !== state.prestigeRevision) {
+        throw new ActionCancelledError('Auto-prestige stopped');
+      }
+    };
+    let dispatched = false;
+    state.prestigeDueAt = Date.now() + PRESTIGE_CHECK_MS;
+    state.prestigeNextCheckAt = Date.now() + PRESTIGE_HINT_MIN_MS;
+    try {
+      let data = readPrestigeState(await api('/api/prestige', { validate, priority: REQUEST_PRIORITY.BACKGROUND }));
+      validate();
+      let checkedAt = Date.now();
+      state.prestigeNextCheckAt = checkedAt + PRESTIGE_HINT_MIN_MS;
+      applyPrestigeState(data);
+      if (!data.canPrestige || state.prestigeComplete) return;
+      const fromLevel = data.prestigeLevel;
+      state.prestigeCommitting = true;
+      // Let dispatched ranking writes finish. New local ranking writes pause
+      // during this short transition; other independent features keep working.
+      await Promise.all(['crime', 'gta', 'auto-rank'].map((lane) => state.actionTails.get(lane)));
+      validate();
+      let prepared = false;
+      const result = await queueAction('/api/prestige/start', 'Starting next prestige', {
+        beforeSend: async () => {
+          validate();
+          if (Date.now() - checkedAt > PRESTIGE_ELIGIBILITY_MAX_AGE_MS) {
+            data = readPrestigeState(await api('/api/prestige', { validate }));
+            validate(); checkedAt = Date.now(); applyPrestigeState(data);
+          }
+          if (!data.canPrestige || data.prestigeLevel !== fromLevel) {
+            throw new ActionCancelledError('Prestige eligibility changed');
+          }
+          prepared = true;
+        },
+        validate: () => {
+          validate();
+          if (prepared && Date.now() - checkedAt > PRESTIGE_ELIGIBILITY_MAX_AGE_MS) {
+            throw new ActionCancelledError('Prestige eligibility needs refreshing');
+          }
+        },
+        onDispatch: () => { dispatched = true; },
+      });
+      validate();
+      const updated = readPrestigeState(result);
+      if (updated.prestigeLevel !== fromLevel + 1 || updated.canPrestige) {
+        throw new Error('Prestige result could not be verified');
+      }
+      applyPrestigeState(updated);
+      state.prestigeNextCheckAt = Date.now() + PRESTIGE_CHECK_MS;
+      state.prestigeStatus = state.prestigeComplete
+        ? 'Final prestige entered — no further prestige checks'
+        : `${updated.prestigeLabel || `Prestige ${updated.prestigeLevel}`} started · ranking continues`;
+      state.crimesDueAt = 0;
+      state.gtaDueAt = 0;
+      state.autoRankDueAt = 0;
+      state.killData = null;
+      state.killDataLoadedAt = 0;
+      state.killDataRevision += 1;
+    } catch (error) {
+      if (generation !== state.generation || revision !== state.prestigeRevision) return;
+      if (!(error instanceof ActionCancelledError)) {
+        handleTaskError('Auto-prestige', error);
+        if (generation !== state.generation) return;
+        // Every retry starts with a new eligibility GET. Never repeat a POST
+        // just because its response was lost or the previous attempt failed.
+        state.prestigeNextCheckAt = Date.now() + Math.max(PRESTIGE_CHECK_MS, errorBackoff(error));
+        state.prestigeDueAt = state.prestigeNextCheckAt;
+        state.prestigeStatus = dispatched
+          ? 'Prestige result needs checking · rechecking in 3 minutes or after server delay'
+          : 'Prestige check delayed · retrying in 3 minutes or after server delay';
+      }
+    } finally {
+      state.prestigeRunning = false;
+      state.prestigeCommitting = false;
+      refreshIdleStatus();
+      requestSchedulerWake();
+    }
+  }
+
   function autoRankIsActiveNow() {
     if (!state.autoRankActive) return false;
     if (state.autoRankEndsAt > Date.now()) return true;
@@ -2514,7 +2705,10 @@
   function discoverJailInmates(data) {
     if (!state.settings.discoverPlayers) return;
     setViewerUsername(data.viewerUsername);
-    const inmateNames = (Array.isArray(data.inmates) ? data.inmates : []).map((inmate) => inmate && inmate.username);
+    // Personal jailbots are virtual inmates, not searchable player accounts.
+    const inmateNames = (Array.isArray(data.inmates) ? data.inmates : [])
+      .filter((inmate) => inmate && inmate.isBot !== true)
+      .map((inmate) => inmate.username);
     addDiscoveredPlayerNames(inmateNames, 'Jail');
   }
 
@@ -3044,6 +3238,21 @@
     return String((inmate && (inmate.id || inmate.username)) || '').trim();
   }
 
+  function jailBustRequest(inmate) {
+    if (!inmate) return null;
+    if (inmate.isBot === true) {
+      // Use the exact personal jail instance returned by /api/jail. Never
+      // infer a bot from its name or retry a respawn with an old generation.
+      const slot = inmate.botSlot;
+      const generation = inmate.botGeneration;
+      if (!Number.isInteger(slot) || slot < 1 || slot > 10
+        || !Number.isSafeInteger(generation) || generation < 1) return null;
+      return { path: `/api/jail/bust-bot/${slot}`, body: { generation } };
+    }
+    const identifier = jailInmateIdentifier(inmate);
+    return identifier ? { path: `/api/jail/bust/${encodeURIComponent(identifier)}` } : null;
+  }
+
   function chooseJailBustCandidate(data) {
     if (!state.settings.jailBust || data.inJail === true) return null;
     // Older/local builds expose internal player IDs. The current live API
@@ -3052,7 +3261,8 @@
     const inmates = (Array.isArray(data.inmates) ? data.inmates : [])
       .filter((inmate) => {
         const identifier = jailInmateIdentifier(inmate);
-        return identifier && identifier.toLocaleLowerCase() !== viewerIdentifier;
+        return jailBustRequest(inmate)
+          && (inmate.isBot === true || identifier.toLocaleLowerCase() !== viewerIdentifier);
       });
 
     inmates.sort((left, right) => {
@@ -3067,8 +3277,8 @@
   async function runJailBust() {
     const inmate = state.jailBustCandidate;
     if (!inmate || state.jailBustRunning || state.inJail) return false;
-    const inmateIdentifier = jailInmateIdentifier(inmate);
-    if (!inmateIdentifier) return false;
+    const request = jailBustRequest(inmate);
+    if (!request) return false;
 
     state.jailBustCandidate = null;
     state.jailBustRunning = true;
@@ -3076,11 +3286,12 @@
     render();
     try {
       await queueAction(
-        `/api/jail/bust/${encodeURIComponent(inmateIdentifier)}`,
-        `Busting ${inmate.username || 'player'}`
+        request.path,
+        `Busting ${inmate.username || 'player'}`,
+        { body: request.body }
       );
       state.jailBustCandidate = null;
-      state.jailBustDueAt = Date.now();
+      state.jailBustDueAt = Date.now() + requestRateWait('jailBust');
       state.jailDueAt = 0;
       return true;
     } catch (error) {
@@ -3091,9 +3302,9 @@
         log(error.message, 'warn');
         markJailed();
       } else if (error instanceof ApiError && error.status === 400 && /not in jail|no longer in jail/i.test(error.message)) {
-        // Another player beat us to this inmate. Refresh immediately instead of
-        // applying the normal error backoff, so the next inmate can be attempted.
-        state.jailBustDueAt = Date.now();
+        // The inmate was released or this personal bot generation expired.
+        // Refresh immediately so the next attempt uses the current jail list.
+        state.jailBustDueAt = Date.now() + requestRateWait('jailBust');
       } else if (!(error instanceof ActionCancelledError)) {
         handleTaskError('Jailbust', error);
         state.jailBustDueAt = Date.now() + errorBackoff(error);
@@ -3131,10 +3342,9 @@
         && !state.jailBustRunning
         && state.jailBustDueAt <= Date.now();
       if (state.settings.jailBust && !state.inJail) {
-        // The request-driven monitor starts the next read as soon as this one
-        // and any resulting bust attempt have settled. The shared limiter still
-        // keeps action POSTs ahead of inmate scans.
-        state.jailDueAt = Date.now();
+        // Check again when the jail-read budget is ready. A discovered inmate
+        // can still be busted immediately, without waiting for another read.
+        state.jailDueAt = Date.now() + requestRateWait('jailRead');
       } else {
         state.jailDueAt = nextTimeFromSeconds(
           state.inJail ? Math.min(Number(data.secondsRemaining) || 3, 3) : 3,
@@ -3182,9 +3392,9 @@
 
     void (async () => {
       try {
-        // Each completed /api/jail request starts the next check directly.
-        // This makes inmate discovery request-driven, so minimized-tab timer
-        // throttling cannot add a delay between a response and the next scan.
+        // Continue directly when the read and bust budgets are ready; otherwise
+        // the scheduler wakes at the next due time. Browser suspension can
+        // still delay timer wakeups.
         while (jailMonitorReady()) {
           const checkedSuccessfully = await checkJail();
           requestSchedulerWake();
@@ -3241,8 +3451,9 @@
     }
     else if (!state.controller) state.currentAction = 'Standby — another tab is active';
     else if (state.inJail) state.currentAction = 'Paused while in jail';
+    else if (state.prestigeCommitting) state.currentAction = 'Starting next prestige';
     else if (autoRankIsActiveNow() && !state.jailBustRunning && !state.drugsRunning && !state.playerSearchRunning && !state.combatRunning) state.currentAction = 'Auto Rank active — server-controlled actions paused locally';
-    else if (!state.crimesRunning && !state.gtaRunning && !state.jailBustRunning && !state.meltRunning && !state.drugsRunning && !state.autoRankRunning && !state.playerDiscoveryRunning && !state.gangDiscoveryRunning && !state.playerSearchRunning && !state.combatRunning && !state.jailRunning) state.currentAction = 'Waiting for next action';
+    else if (!state.crimesRunning && !state.gtaRunning && !state.jailBustRunning && !state.meltRunning && !state.drugsRunning && !state.autoRankRunning && !state.prestigeRunning && !state.playerDiscoveryRunning && !state.gangDiscoveryRunning && !state.playerSearchRunning && !state.combatRunning && !state.jailRunning) state.currentAction = 'Waiting for next action';
     render();
   }
 
@@ -3252,7 +3463,7 @@
     const beam = Boolean(activeBeamName());
     const serverRanking = autoRankIsActiveNow();
     const rankBusy = state.crimesRunning || state.gtaRunning || state.meltRunning;
-    const rankTransition = state.autoRankRunning || (state.settings.autoRank && state.autoRankDueAt <= now);
+    const rankTransition = state.prestigeCommitting || state.autoRankRunning || (state.settings.autoRank && state.autoRankDueAt <= now);
     const canRank = !state.inJail && !rankTransition;
     const monitor = state.settings.jailBust && !state.inJail;
     const tasks = [];
@@ -3262,7 +3473,9 @@
     add(true, state.jailMonitorRunning || state.jailRunning || state.jailBustRunning,
       monitor ? Math.max(state.jailDueAt, state.jailBustDueAt) : state.jailDueAt,
       monitor ? ensureJailMonitor : checkJail);
-    add(state.settings.autoRank && !rankBusy, state.autoRankRunning, state.autoRankDueAt, runAutoRank);
+    add(!state.inJail && state.settings.autoPrestige && !state.prestigeComplete,
+      state.prestigeRunning, state.prestigeDueAt, runPrestige);
+    add(state.settings.autoRank && !rankBusy && !state.prestigeCommitting, state.autoRankRunning, state.autoRankDueAt, runAutoRank);
     add(canRank && state.settings.crimes && !(serverRanking && state.autoRankControls.crimes), state.crimesRunning, state.crimesDueAt, runCrimes);
     add(canRank && state.settings.gta && !(serverRanking && state.autoRankControls.gta), state.gtaRunning, state.gtaDueAt, runGta);
     // Only melting needs the favourite-car guard loaded first. Crimes/GTA
@@ -3287,6 +3500,9 @@
   }
 
   function tick() {
+    // Also inspect on normal scheduler wakes so enabling/resuming and missing
+    // MutationObserver support cannot miss an already-present sidebar button.
+    checkPrestigeSidebar();
     if (!actionAllowed() || state.authRequired) { refreshIdleStatus(); return; }
     const now = Date.now();
     if (state.globalRateLimitedUntil > now) {
@@ -3379,8 +3595,10 @@
             <label><input type="checkbox" id="ul-simple-gta"> GTA</label>
             <label title="Failed attempts can send your character to jail"><input type="checkbox" id="ul-simple-jailbust"> Jailbust</label>
             <label title="Starts a new server-side Auto Rank session after its activity timer genuinely expires"><input type="checkbox" id="ul-simple-auto-rank"> Auto-renew rank</label>
+            <label title="Watches the sidebar Prestige button, with a 3-minute fallback check. Confirms eligibility through the API before starting. Resets rank to Civilian; other assets are kept."><input type="checkbox" id="ul-simple-auto-prestige"> Auto-prestige</label>
           </div>
           <div id="ul-simple-auto-rank-status">Auto Rank not checked</div>
+          <div id="ul-simple-prestige-status">Auto-prestige disabled</div>
         </section>
 
         <section class="ul-simple-tab-panel" data-tab-panel="cars" role="tabpanel" hidden>
@@ -3559,6 +3777,7 @@
       #ul-simple-bot .ul-simple-drug-settings input { width:48px; padding:3px; color:#eee; background:#1b1b1b; border:1px solid #555; }
       #ul-simple-bot #ul-simple-drug-status { margin-bottom:8px; color:#9fd5ff; }
       #ul-simple-bot #ul-simple-auto-rank-status { margin-bottom:8px; color:#b8e3b8; }
+      #ul-simple-bot #ul-simple-prestige-status { margin-bottom:8px; color:#b8e3b8; }
       #ul-simple-bot .ul-simple-player-list-wrap { padding:6px; border:1px solid #333; background:#151515; }
       #ul-simple-bot #ul-simple-player-status { margin-bottom:5px; color:#9fd5ff; }
       #ul-simple-bot #ul-simple-player-list { display:block; width:100%; resize:vertical; padding:4px; color:#eee; background:#0d0d0d; border:1px solid #555; font:11px/1.3 monospace; }
@@ -3614,6 +3833,7 @@
     const melt = host.querySelector('#ul-simple-melt');
     const drugs = host.querySelector('#ul-simple-drugs');
     const autoRank = host.querySelector('#ul-simple-auto-rank');
+    const autoPrestige = host.querySelector('#ul-simple-auto-prestige');
     const discoverPlayers = host.querySelector('#ul-simple-discover-players');
     const searchPlayers = host.querySelector('#ul-simple-search-players');
     const beamTravel = host.querySelector('#ul-simple-beam-travel');
@@ -3673,6 +3893,7 @@
       state.drugFavouriteCarId = null;
       state.drugsDueAt = 0;
     });
+    autoPrestige.addEventListener('change', () => saveSettings({ autoPrestige: autoPrestige.checked }));
     autoRank.addEventListener('change', () => {
       saveSettings({ autoRank: autoRank.checked });
       state.autoRankDueAt = 0;
@@ -3847,6 +4068,7 @@
     host.querySelector('#ul-simple-melt').checked = showActiveSelections && state.settings.melt;
     host.querySelector('#ul-simple-drugs').checked = showActiveSelections && state.settings.drugs;
     host.querySelector('#ul-simple-auto-rank').checked = showActiveSelections && state.settings.autoRank;
+    host.querySelector('#ul-simple-auto-prestige').checked = showActiveSelections && state.settings.autoPrestige;
     host.querySelector('#ul-simple-discover-players').checked = showActiveSelections && state.settings.discoverPlayers;
     host.querySelector('#ul-simple-search-players').checked = showActiveSelections && state.settings.searchPlayers;
     host.querySelector('#ul-simple-beam-travel').value = state.settings.beamTravelMode;
@@ -3861,6 +4083,9 @@
     host.querySelector('#ul-simple-drug-repair-damage').value = String(state.settings.drugRepairDamage);
     host.querySelector('#ul-simple-drug-repair-damage').disabled = !state.settings.drugs;
     host.querySelector('#ul-simple-drug-status').textContent = state.settings.drugs ? state.drugStatus : 'Drug run disabled';
+    host.querySelector('#ul-simple-prestige-status').textContent = state.stoppedForDeath
+      ? 'Auto-prestige paused after death'
+      : state.settings.autoPrestige ? state.prestigeStatus : 'Auto-prestige disabled';
     host.querySelector('#ul-simple-auto-rank-status').textContent = state.settings.autoRank || /Tier 1 is not unlocked/.test(state.autoRankStatus)
       ? state.autoRankStatus
       : 'Auto-renew disabled';
@@ -3894,6 +4119,7 @@
       '#ul-simple-melt',
       '#ul-simple-drugs',
       '#ul-simple-auto-rank',
+      '#ul-simple-auto-prestige',
       '#ul-simple-discover-players',
       '#ul-simple-search-players',
     ]) {
@@ -4213,7 +4439,9 @@
     const starting = nextSettings.enabled && !state.settings.enabled;
     if (!nextSettings.enabled && state.settings.enabled) state.generation += 1;
     const wasStoppedForDeath = state.stoppedForDeath;
+    const wasAutoPrestige = state.settings.autoPrestige;
     state.settings = nextSettings;
+    syncPrestigeSetting(wasAutoPrestige);
     if (starting) prepareRuntimeForStart(wasStoppedForDeath);
     else if (state.settings.enabled) wakeAll();
     render();
@@ -4283,6 +4511,7 @@
 
   restorePerTabState(() => {
     createPanel();
+    startPrestigeSidebarWatcher();
     startLoginRecoveryWatcher();
     if (state.botTab) startControllerElection();
     startRestartWatcher();
