@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Underworld Legacy Bot - Licensed Loader
 // @namespace    https://underworldlegacy.com/
-// @version      2.2.6
+// @version      2.2.8
 // @description  Licensed server-driven Underworld Legacy bot. Full automation suite with remote licence control and local-only credentials/restart data.
 // @author       Aphotic
 // @updateURL    https://raw.githubusercontent.com/ssdddssdfswee/UL-Bot/main/ul-simple-crimes-gta-v1.0.0.user.js
@@ -21,7 +21,7 @@
   'use strict';
 
   const SCRIPT_NAME = 'Underworld Legacy Bot';
-  const SCRIPT_VERSION = '2.2.6';
+  const SCRIPT_VERSION = '2.2.8';
   const WORKER_URL = 'https://ul-bot-license.ugarchive.workers.dev';
   const LOADER_UPDATE_URL = 'https://raw.githubusercontent.com/ssdddssdfswee/UL-Bot/main/ul-simple-crimes-gta-v1.0.0.user.js';
   const PLANNER_SOCKET_URL = WORKER_URL.replace(/^http/, 'ws') + '/api/v2/socket';
@@ -168,6 +168,10 @@
     updateUrl: LOADER_UPDATE_URL,
     updateLastCheckedAt: 0,
     licenceFeatures: new Set(),
+    // Selected only from a successful licence-session response. Once selected,
+    // the owner fast-jail engine follows the legacy v2.2.3 stream lifecycle
+    // without re-checking feature flags in the hot SSE/reconnect path.
+    fastJailEngine: false,
     controller: false,
     currentAction: 'Stopped',
     crimesRunning: false,
@@ -316,6 +320,7 @@
     token = '';
     tokenExpiresAt = 0;
     state.licenceFeatures.clear();
+    state.fastJailEngine = false;
     state.licenceCode = String(error?.code || 'disabled');
     state.licenceStatus = friendly(error);
     state.licenceError = true;
@@ -359,6 +364,7 @@
         });
         token = String(data.token || '');
         tokenExpiresAt = Number(data.expiresAt) || 0;
+        applySessionLicenceFeatures(data);
         applyVersionInfo(data);
         state.licenceCode = '';
         state.licenceStatus = `Licence active · ${GM_getValue(KEYS.deviceLabel, 'Browser')}`;
@@ -1770,9 +1776,7 @@
   }
 
   function jailStreamShouldRun() {
-    // Fast live-inmate SSE is a licence capability. Standard licences never
-    // open /api/jail/stream and use the normal /api/jail polling lane instead.
-    return Boolean(automationAllowed() && state.settings.jailBust && hasFeature(LICENCE_FEATURE.FAST_JAIL_STREAM));
+    return Boolean(automationAllowed() && state.settings.jailBust);
   }
 
   function stopJailStream() {
@@ -1788,13 +1792,23 @@
     jailLatestStreamInmates = [];
   }
 
-  function syncJailStream() {
+  function syncLegacyJailStream() {
     if (!jailStreamShouldRun()) {
       stopJailStream();
       return;
     }
     if (jailEventSource || jailReconnectTimer) return;
     connectJailStream();
+  }
+
+  function syncJailStream() {
+    // Licence selection happens outside the known-good v2.2.2 stream engine.
+    // Standard licences never enter the SSE engine at all.
+    if (!state.fastJailEngine) {
+      stopJailStream();
+      return;
+    }
+    syncLegacyJailStream();
   }
 
   function scheduleJailStreamReconnect() {
@@ -1947,7 +1961,189 @@
   }
 
 
-  async function runJailBust() {
+  async function runJailBustLegacyFast() {
+    if (!automationAllowed() || (!state.settings.jailBust && !state.inJail) || state.jailBustRunning) return;
+    state.jailBustRunning = true;
+    if (state.settings.jailBust) markFeatureEpoch('jail');
+    state.currentAction = state.inJail ? 'Checking jail sentence' : 'Checking jail for busts';
+    state.jailStatus = state.currentAction;
+    render();
+    try {
+      const page = await gameJson('/api/jail', { priority: REQUEST_PRIORITY.RAPID });
+      if (!automationAllowed()) return;
+
+      const wasInJail = state.inJail;
+      if (page?.inJail === true) {
+        markJailed();
+      } else if (wasInJail) {
+        const released = await confirmJailRelease();
+        if (released) {
+          log('Released from jail — resuming actions', 'ok');
+          state.crimesDueAt = 0;
+          state.gtaDueAt = 0;
+          state.meltDueAt = 0;
+          state.drugsDueAt = 0;
+          state.autoRankDueAt = 0;
+          state.prestigeDueAt = 0;
+          state.autoGunDueAt = 0;
+          state.playerSearchDueAt = 0;
+          state.combatDueAt = 0;
+          state.qtDueAt = 0;
+          if (state.settings.jailBust && jailLatestStreamInmates.length) void processLiveJailSnapshot();
+        }
+      }
+
+      if (state.inJail) {
+        state.jailBustDueAt = Date.now() + JAIL_RELEASE_POLL_MS;
+        state.currentAction = 'Paused while in jail';
+        state.jailStatus = `In jail · checking release in ${formatWait(JAIL_RELEASE_POLL_MS)}`;
+        return;
+      }
+
+      // If Jailbust is disabled, this lane exists only to confirm release.
+      if (!state.settings.jailBust) {
+        state.jailBustDueAt = Infinity;
+        state.jailStatus = 'Jailbust disabled';
+        return;
+      }
+
+      const viewerUsername = String(page?.viewerUsername || '').trim();
+      const viewerBustToken = String(page?.viewerBustToken || '').trim();
+      state.jailViewerUsername = viewerUsername;
+      state.jailViewerBustToken = viewerBustToken;
+      const inmates = (Array.isArray(page?.inmates) ? page.inmates : []).slice(0, 100);
+      if (state.settings.discoverPlayers) {
+        addDiscoveredPlayers(
+          inmates.filter((row) => row && row.isBot !== true && row.usernameHidden !== true).map((row) => row.username),
+          'Jail'
+        );
+      }
+
+      // The jail target rule is intentionally local for speed and to avoid a
+      // high-frequency Cloudflare planner message. It is already visible in the
+      // SSE hot path: highest reward, then shortest sentence. Real inmates are
+      // handled by SSE while connected; GET remains the source for personal bots.
+      const candidates = [];
+      for (const inmate of inmates) {
+        if (!inmate || typeof inmate !== 'object') continue;
+        const username = String(inmate.username || '').trim();
+        const bustToken = String(inmate.bustToken || '').trim();
+        const isBot = inmate.isBot === true;
+        const isSelf = !isBot && (
+          (bustToken && viewerBustToken && bustToken === viewerBustToken)
+          || (!inmate.usernameHidden && username && viewerUsername && normalizePlayerName(username) === normalizePlayerName(viewerUsername))
+        );
+        const target = bustToken || username;
+        const botGeneration = Number(inmate.botGeneration);
+        const validBot = !isBot || (Number.isSafeInteger(botGeneration) && botGeneration >= 1);
+        if (isSelf || !target || target.length > 64 || !validBot) continue;
+        if (jailStreamReady && !isBot) continue;
+        let reward = 0n;
+        try { if (/^\d{1,36}$/.test(String(inmate.bustReward ?? ''))) reward = BigInt(String(inmate.bustReward)); } catch {}
+        const seconds = Number.isFinite(Number(inmate.secondsRemaining)) ? Math.max(0, Number(inmate.secondsRemaining)) : 86_400;
+        candidates.push({ inmate, target, reward, seconds });
+      }
+      candidates.sort((a, b) => a.reward !== b.reward ? (a.reward > b.reward ? -1 : 1) : a.seconds - b.seconds);
+      const candidate = candidates[0] || null;
+
+      if (!candidate) {
+        const waitMs = jailStreamReady ? JAIL_STREAM_FALLBACK_POLL_MS : JAIL_POLL_FALLBACK_MS;
+        state.jailBustDueAt = Date.now() + waitMs;
+        state.currentAction = 'Watching jail';
+        state.jailStatus = `No bust target · checking again in ${formatWait(waitMs)}`;
+        return;
+      }
+
+      const rateWait = Math.max(0, state.lastJailBustAt + JAIL_BUST_MIN_INTERVAL_MS - Date.now());
+      if (rateWait > 0) {
+        state.jailBustDueAt = Date.now() + rateWait;
+        state.jailStatus = `Jailbust rate pacing · ${formatWait(rateWait)}`;
+        return;
+      }
+
+      const inmate = candidate.inmate;
+      const displayName = inmate?.usernameHidden ? 'Unknown' : String(inmate?.username || 'player');
+      state.currentAction = `Busting ${displayName}`;
+      state.jailStatus = state.currentAction;
+      render();
+
+      state.lastJailBustAt = Date.now();
+      let result = null;
+      let error = null;
+      try {
+        result = await gameJson(`/api/jail/bust/${encodeURIComponent(candidate.target)}`, inmate?.isBot === true
+          ? { method: 'POST', body: { generation: Number(inmate.botGeneration) } }
+          : { method: 'POST' });
+        log(cleanGameMessage(result?.html) || `Busted ${displayName}`, result?.success === false ? 'warn' : 'ok');
+      } catch (caught) {
+        if (caught instanceof ActionCancelledError) {
+          state.jailBustDueAt = Date.now() + 250;
+          return;
+        }
+        error = caught;
+        const message = friendlyGameError(caught);
+        const gotCaught = caught?.body?.success === false || /got caught trying to bust|cannot bust players while you are in jail/i.test(message);
+        const stale = caught?.status === 404 || (caught?.status === 400 && /not in jail|no longer in jail|dead|not found/i.test(message));
+        if (gotCaught) {
+          markJailed();
+          log(`Jailbust: ${message}`, 'warn');
+        } else if (!stale) {
+          log(`Jailbust: ${message}`, caught?.status === 429 ? 'warn' : 'error');
+        }
+      }
+
+      const message = error ? friendlyGameError(error) : '';
+      const bustFailed = !!(error && (error?.body?.success === false || /got caught trying to bust|cannot bust players while you are in jail/i.test(message)));
+      const targetStale = !!(error && (error?.status === 404 || (error?.status === 400 && /not in jail|no longer in jail|dead|not found/i.test(message))));
+
+      if (error?.status === 401) {
+        state.currentAction = 'Game login required';
+        state.jailStatus = 'Game session expired · automatic login recovery active';
+        return;
+      }
+
+      if (bustFailed || state.inJail) {
+        markJailed();
+        state.crimesDueAt = Date.now() + CRIME_JAIL_POLL_MS;
+        state.gtaDueAt = Date.now() + CRIME_JAIL_POLL_MS;
+        state.jailBustDueAt = Date.now() + JAIL_RELEASE_POLL_MS;
+        state.currentAction = 'Paused while in jail';
+        state.jailStatus = 'Jailbust failed · waiting for release';
+      } else {
+        const retryAfterMs = error?.status === 429
+          ? (Number(error?.retryAfter) > 0 ? Number(error.retryAfter) * 1000 + 50 : 250)
+          : 0;
+        const serverWait = targetStale || (!error && result?.success !== false) ? 100 : (error ? 1_000 : 100);
+        const localWait = Math.max(0, state.lastJailBustAt + JAIL_BUST_MIN_INTERVAL_MS - Date.now());
+        const waitMs = Math.max(retryAfterMs, serverWait, localWait);
+        state.jailBustDueAt = Date.now() + waitMs;
+        state.currentAction = targetStale ? 'Refreshing jail' : 'Watching jail';
+        state.jailStatus = targetStale
+          ? 'Target left jail · refreshing'
+          : error
+            ? `Jailbust check · retrying in ${formatWait(waitMs)}`
+            : `Jailbust complete · checking again in ${formatWait(waitMs)}`;
+      }
+    } catch (error) {
+      if (error instanceof ActionCancelledError) {
+        state.jailBustDueAt = Date.now() + 250;
+        return;
+      }
+      const waitMs = error?.status === 429 && Number(error?.retryAfter) > 0
+        ? Number(error.retryAfter) * 1000 + 50
+        : (state.inJail ? JAIL_RELEASE_POLL_MS : 1_000);
+      state.jailBustDueAt = Date.now() + waitMs;
+      state.currentAction = 'Jail check failed · waiting to retry';
+      state.jailStatus = `Jail check failed: ${friendlyGameError(error)}`;
+      log(`Jailbust: ${friendlyGameError(error)}`, error?.status === 429 ? 'warn' : 'error');
+      if (error?.status === 401) state.currentAction = 'Game login required';
+    } finally {
+      state.jailBustRunning = false;
+      render();
+    }
+  }
+
+  async function runJailBustStandard() {
     if (!automationAllowed() || (!state.settings.jailBust && !state.inJail) || state.jailBustRunning || state.jailReadRunning) return;
     // Keep the ordinary /api/jail read separate from the actual bust lock. The
     // owner live stream can then dispatch a real-player bust immediately even
@@ -2140,10 +2336,15 @@
     } finally {
       state.jailReadRunning = false;
       render();
-      if (jailStreamShouldRun() && !state.inJail && jailLatestStreamInmates.length) {
+      if (state.fastJailEngine && jailStreamShouldRun() && !state.inJail && jailLatestStreamInmates.length) {
         queueMicrotask(() => void processLiveJailSnapshot());
       }
     }
+  }
+
+  async function runJailBust() {
+    if (state.fastJailEngine) return runJailBustLegacyFast();
+    return runJailBustStandard();
   }
 
 
@@ -5081,17 +5282,25 @@
     return out;
   }
 
+  function applySessionLicenceFeatures(info) {
+    if (!info || typeof info !== 'object') return;
+    // Successful sessions fail closed: a missing/malformed feature payload must
+    // never preserve a previously selected owner-only engine.
+    const nextFeatures = normaliseLicenceFeatures(
+      Object.prototype.hasOwnProperty.call(info, 'features') ? info.features : []
+    );
+    const nextFastJailEngine = nextFeatures.has(LICENCE_FEATURE.FAST_JAIL_STREAM);
+    const changed = state.fastJailEngine !== nextFastJailEngine;
+    state.licenceFeatures = nextFeatures;
+    state.fastJailEngine = nextFastJailEngine;
+    if (changed) {
+      if (!nextFastJailEngine) stopJailStream();
+      else syncJailStream();
+    }
+  }
+
   function applyVersionInfo(info) {
     if (!info || typeof info !== 'object') return;
-    if (Object.prototype.hasOwnProperty.call(info, 'features')) {
-      const hadFastJail = hasFeature(LICENCE_FEATURE.FAST_JAIL_STREAM);
-      state.licenceFeatures = normaliseLicenceFeatures(info.features);
-      const hasFastJail = hasFeature(LICENCE_FEATURE.FAST_JAIL_STREAM);
-      if (hadFastJail !== hasFastJail) {
-        if (!hasFastJail) stopJailStream();
-        else syncJailStream();
-      }
-    }
     const latest = String(info.latestLoaderVersion || info.botVersion || '').trim();
     const minimum = String(info.minLoaderVersion || '').trim();
     const updateUrl = String(info.updateUrl || '').trim();
