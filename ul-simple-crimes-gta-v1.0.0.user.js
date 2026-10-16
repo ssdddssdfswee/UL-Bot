@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Underworld Legacy Bot - Licensed Loader
 // @namespace    https://underworldlegacy.com/
-// @version      2.2.5
+// @version      2.2.6
 // @description  Licensed server-driven Underworld Legacy bot. Full automation suite with remote licence control and local-only credentials/restart data.
 // @author       Aphotic
 // @updateURL    https://raw.githubusercontent.com/ssdddssdfswee/UL-Bot/main/ul-simple-crimes-gta-v1.0.0.user.js
@@ -21,7 +21,7 @@
   'use strict';
 
   const SCRIPT_NAME = 'Underworld Legacy Bot';
-  const SCRIPT_VERSION = '2.2.5';
+  const SCRIPT_VERSION = '2.2.6';
   const WORKER_URL = 'https://ul-bot-license.ugarchive.workers.dev';
   const LOADER_UPDATE_URL = 'https://raw.githubusercontent.com/ssdddssdfswee/UL-Bot/main/ul-simple-crimes-gta-v1.0.0.user.js';
   const PLANNER_SOCKET_URL = WORKER_URL.replace(/^http/, 'ws') + '/api/v2/socket';
@@ -175,6 +175,7 @@
     gtaRunning: false,
     gtaDueAt: 0,
     jailBustRunning: false,
+    jailReadRunning: false,
     jailBustDueAt: 0,
     lastJailBustAt: 0,
     meltRunning: false,
@@ -1412,7 +1413,7 @@
     return [
       ['Crimes', f.canRank && state.settings.crimes && !(f.serverRanking && state.autoRankControls.crimes) && !state.crimesRunning ? state.crimesDueAt : Infinity, runCrimes],
       ['GTA', f.canRank && state.settings.gta && !(f.serverRanking && state.autoRankControls.gta) && !state.gtaRunning ? state.gtaDueAt : Infinity, runGta],
-      ['Jail monitor', (state.settings.jailBust || state.inJail) && !state.jailBustRunning ? state.jailBustDueAt : Infinity, runJailBust],
+      ['Jail monitor', (state.settings.jailBust || state.inJail) && !state.jailBustRunning && !state.jailReadRunning ? state.jailBustDueAt : Infinity, runJailBust],
       ['Melt', f.canRank && state.settings.melt && !(f.serverRanking && state.autoRankControls.melt) && !state.meltRunning ? state.meltDueAt : Infinity, runMelt],
       ['Drugs', !state.inJail && state.settings.drugs && !(f.serverRanking && state.autoRankControls.drugs) && !f.beam && !state.combatRunning && !state.drugsRunning ? state.drugsDueAt : Infinity, runDrugs],
       ['Auto Rank', state.settings.autoRank && !f.rankBusy && !state.prestigeCommitting && !state.autoRankRunning ? state.autoRankDueAt : Infinity, runAutoRank],
@@ -1451,7 +1452,7 @@
 
     const wait = Math.max(1, due - Date.now());
     automationTimer = setTimeout(() => void automationTick(), wait);
-    const anyRunning = state.crimesRunning || state.gtaRunning || state.jailBustRunning || state.meltRunning ||
+    const anyRunning = state.crimesRunning || state.gtaRunning || state.jailBustRunning || state.jailReadRunning || state.meltRunning ||
       state.drugsRunning || state.autoRankRunning || state.prestigeRunning || state.autoGunRunning ||
       state.playerDiscoveryRunning || state.gangDiscoveryRunning || state.playerSearchRunning ||
       state.combatRunning || state.qtRunning;
@@ -1947,8 +1948,11 @@
 
 
   async function runJailBust() {
-    if (!automationAllowed() || (!state.settings.jailBust && !state.inJail) || state.jailBustRunning) return;
-    state.jailBustRunning = true;
+    if (!automationAllowed() || (!state.settings.jailBust && !state.inJail) || state.jailBustRunning || state.jailReadRunning) return;
+    // Keep the ordinary /api/jail read separate from the actual bust lock. The
+    // owner live stream can then dispatch a real-player bust immediately even
+    // if the fallback jail read is still in flight.
+    state.jailReadRunning = true;
     if (state.settings.jailBust) markFeatureEpoch('jail');
     state.currentAction = state.inJail ? 'Checking jail sentence' : 'Checking jail for busts';
     state.jailStatus = state.currentAction;
@@ -2052,6 +2056,15 @@
       state.jailStatus = state.currentAction;
       render();
 
+      // A live SSE event may have started a real-player bust while this GET
+      // was in flight. Never race a second bust; retry the polling lane shortly.
+      if (state.jailBustRunning) {
+        state.jailBustDueAt = Date.now() + 25;
+        state.jailStatus = 'Live jailbust in progress';
+        return;
+      }
+
+      state.jailBustRunning = true;
       state.lastJailBustAt = Date.now();
       let result = null;
       let error = null;
@@ -2075,6 +2088,8 @@
         } else if (!stale) {
           log(`Jailbust: ${message}`, caught?.status === 429 ? 'warn' : 'error');
         }
+      } finally {
+        state.jailBustRunning = false;
       }
 
       const message = error ? friendlyGameError(error) : '';
@@ -2123,8 +2138,11 @@
       log(`Jailbust: ${friendlyGameError(error)}`, error?.status === 429 ? 'warn' : 'error');
       if (error?.status === 401) state.currentAction = 'Game login required';
     } finally {
-      state.jailBustRunning = false;
+      state.jailReadRunning = false;
       render();
+      if (jailStreamShouldRun() && !state.inJail && jailLatestStreamInmates.length) {
+        queueMicrotask(() => void processLiveJailSnapshot());
+      }
     }
   }
 
