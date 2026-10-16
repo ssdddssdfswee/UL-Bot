@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Underworld Legacy Bot - Licensed Loader
 // @namespace    https://underworldlegacy.com/
-// @version      2.2.8
+// @version      2.2.17
 // @description  Licensed server-driven Underworld Legacy bot. Full automation suite with remote licence control and local-only credentials/restart data.
 // @author       Aphotic
 // @updateURL    https://raw.githubusercontent.com/ssdddssdfswee/UL-Bot/main/ul-simple-crimes-gta-v1.0.0.user.js
@@ -14,6 +14,7 @@
 // @grant        GM_setValue
 // @grant        GM_xmlhttpRequest
 // @connect      ul-bot-license.ugarchive.workers.dev
+// @connect      underworldlegacy.com
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -21,7 +22,7 @@
   'use strict';
 
   const SCRIPT_NAME = 'Underworld Legacy Bot';
-  const SCRIPT_VERSION = '2.2.8';
+  const SCRIPT_VERSION = '2.2.17';
   const WORKER_URL = 'https://ul-bot-license.ugarchive.workers.dev';
   const LOADER_UPDATE_URL = 'https://raw.githubusercontent.com/ssdddssdfswee/UL-Bot/main/ul-simple-crimes-gta-v1.0.0.user.js';
   const PLANNER_SOCKET_URL = WORKER_URL.replace(/^http/, 'ws') + '/api/v2/socket';
@@ -36,6 +37,10 @@
   const CONTROLLER_LOCK = 'ul-cloud-bot-controller-v1';
   const CRIME_JAIL_POLL_MS = 5_000;
   const JAIL_BUST_MIN_INTERVAL_MS = 205;
+  // Owner fast-stream lane does not impose even spacing. The existing
+  // jailBust request bucket remains capped at 5 requests per rolling second,
+  // matching the game's flood ceiling while allowing short legal bursts.
+  const FAST_JAIL_BUST_MIN_INTERVAL_MS = 0;
   const JAIL_RELEASE_POLL_MS = 3_000;
   const JAIL_RELEASE_CONFIRM_DELAY_MS = 3_000;
   const JAIL_STREAM_FALLBACK_POLL_MS = 2_000;
@@ -78,6 +83,9 @@
     login: 'ul_cloud_full_login_v1',
     collapsed: 'ul_cloud_full_collapsed_v1',
     botTab: 'ul_cloud_full_bot_tab_v1',
+    logs: 'ul_cloud_full_logs_v1',
+    jailDiagnostics: 'ul_cloud_full_jail_diagnostics_v1',
+    secondaryJail: 'ul_cloud_full_secondary_jail_v1',
   });
 
   const AUTO_GUNS = Object.freeze([
@@ -144,6 +152,30 @@
   let jailStreamReconnectDelayMs = 1_000;
   let jailLatestStreamInmates = [];
   let jailStreamBustTimer = null;
+  // Fast-owner collision avoidance state. The SSE payload is a full snapshot;
+  // remember which real inmates were already present so a newly jailed player
+  // can be attacked before we fall back to older, more contested inmates.
+  let jailLiveSnapshotPrimed = false;
+  let jailLivePreviousTargets = new Set();
+  let jailLiveFreshTargets = [];
+  // Optional owner-only second authenticated stream. This stays entirely in the
+  // userscript: it creates one extra normal game session and asks Tampermonkey
+  // to attach that session cookie only to the second SSE request. Because nginx
+  // hashes ug_session, the second token can land on a different API replica.
+  const persistedSecondaryJail = loadSecondaryJailState();
+  let jailSecondaryEnabled = persistedSecondaryJail.enabled;
+  let jailSecondaryToken = persistedSecondaryJail.token;
+  let jailSecondaryRequest = null;
+  let jailSecondaryReconnectTimer = null;
+  let jailSecondaryReconnectDelayMs = 1_000;
+  let jailSecondaryReady = false;
+  let jailSecondaryLatestInmates = [];
+  let jailSecondarySnapshotPrimed = false;
+  let jailSecondaryPreviousTargets = new Set();
+  let jailRecentAttemptedTargets = new Map();
+  let jailTargetSightings = new Map();
+  let jailSecondarySessionPromise = null;
+  let runtimePersistTimer = null;
   let restartTimer = null;
   let loginRunning = false;
   let state = {
@@ -168,10 +200,6 @@
     updateUrl: LOADER_UPDATE_URL,
     updateLastCheckedAt: 0,
     licenceFeatures: new Set(),
-    // Selected only from a successful licence-session response. Once selected,
-    // the owner fast-jail engine follows the legacy v2.2.3 stream lifecycle
-    // without re-checking feature flags in the hot SSE/reconnect path.
-    fastJailEngine: false,
     controller: false,
     currentAction: 'Stopped',
     crimesRunning: false,
@@ -260,8 +288,133 @@
     automationEpoch: 0,
     featureEpochs: Object.create(null),
 
-    logs: [],
+    logs: loadLogs(),
   };
+
+  const jailDiagnostics = {
+    startedAt: Date.now(),
+    streamConnectAttempts: 0,
+    streamReady: 0,
+    streamSuperseded: 0,
+    streamErrors: 0,
+    inmateEvents: 0,
+    inmateEventServerAgeSamples: 0,
+    inmateEventServerAgeTotalMs: 0,
+    inmateEventServerAgeMaxMs: 0,
+    inmateServerGapSamples: 0,
+    inmateServerGapTotalMs: 0,
+    inmateServerGapMinMs: 0,
+    inmateServerGapMaxMs: 0,
+    inmateGapLt250: 0,
+    inmateGap250To749: 0,
+    inmateGap750To1249: 0,
+    inmateGap1250To2249: 0,
+    inmateGap2250Plus: 0,
+    inmateGapNearWholeSecond: 0,
+    attemptNearCadence: 0,
+    successNearCadence: 0,
+    staleNearCadence: 0,
+    attemptOffCadence: 0,
+    successOffCadence: 0,
+    staleOffCadence: 0,
+    inmateSourceInitial: 0,
+    inmateSourceSignal: 0,
+    inmateSourceWatch: 0,
+    inmateSourceUnknown: 0,
+    attemptSourceInitial: 0,
+    successSourceInitial: 0,
+    staleSourceInitial: 0,
+    attemptSourceSignal: 0,
+    successSourceSignal: 0,
+    staleSourceSignal: 0,
+    attemptSourceWatch: 0,
+    successSourceWatch: 0,
+    staleSourceWatch: 0,
+    attemptSourceUnknown: 0,
+    successSourceUnknown: 0,
+    staleSourceUnknown: 0,
+    eventSequence: 0,
+    lastInmateServerAtMs: 0,
+    attemptTrace: [],
+    liveSnapshotsNoCandidate: 0,
+    liveSnapshotsBlockedBusy: 0,
+    liveSnapshotsBlockedInJail: 0,
+    liveSnapshotsRateDeferred: 0,
+    liveBustAttempts: 0,
+    liveBustSuccess: 0,
+    liveBustStale: 0,
+    liveBust429: 0,
+    liveBustCaught: 0,
+    liveBustOtherErrors: 0,
+    liveBustRoundTripSamples: 0,
+    liveBustRoundTripTotalMs: 0,
+    liveBustRoundTripMaxMs: 0,
+    liveFreshTargetsSeen: 0,
+    liveFreshSelections: 0,
+    liveFallbackSelections: 0,
+    liveMultiCandidateSelections: 0,
+    liveDispatchPrepSamples: 0,
+    liveDispatchPrepTotalMs: 0,
+    liveDispatchPrepMaxMs: 0,
+    liveQueuedTargetDropped: 0,
+    liveBurstContinuations: 0,
+    liveEventToDispatchSamples: 0,
+    liveEventToDispatchTotalMs: 0,
+    liveEventToDispatchMaxMs: 0,
+    attemptVisible: 0,
+    successVisible: 0,
+    staleVisible: 0,
+    attemptHidden: 0,
+    successHidden: 0,
+    staleHidden: 0,
+    secondarySessionLoginAttempts: 0,
+    secondarySessionLoginSuccess: 0,
+    secondarySessionLoginErrors: 0,
+    secondaryStreamConnectAttempts: 0,
+    secondaryStreamReady: 0,
+    secondaryStreamErrors: 0,
+    secondaryInmateEvents: 0,
+    secondaryFreshTargetsSeen: 0,
+    secondaryOnlyFreshTargetsSeen: 0,
+    secondaryOnlySelections: 0,
+    secondaryOnlySuccess: 0,
+    secondaryOnlyStale: 0,
+    primaryOnlySelections: 0,
+    primaryOnlySuccess: 0,
+    primaryOnlyStale: 0,
+    bothSeenSelections: 0,
+    bothSeenSuccess: 0,
+    bothSeenStale: 0,
+    firstSeenPrimarySelections: 0,
+    firstSeenSecondarySelections: 0,
+    firstSeenPrimarySuccess: 0,
+    firstSeenSecondarySuccess: 0,
+    firstSeenPrimaryStale: 0,
+    firstSeenSecondaryStale: 0,
+    primaryLeadSamples: 0,
+    primaryLeadTotalMs: 0,
+    primaryLeadMaxMs: 0,
+    secondaryLeadSamples: 0,
+    secondaryLeadTotalMs: 0,
+    secondaryLeadMaxMs: 0,
+    streamLeadTies: 0,
+    runtimeReloadRestores: 0,
+    jailBustQueueSamples: 0,
+    jailBustQueueTotalMs: 0,
+    jailBustQueueMaxMs: 0,
+    jailBustNetworkSamples: 0,
+    jailBustNetworkTotalMs: 0,
+    jailBustNetworkMaxMs: 0,
+    jailReadSamples: 0,
+    jailReadTotalMs: 0,
+    jailReadMaxMs: 0,
+    lastInmateEventAt: 0,
+    lastInmateServerTime: '',
+    lastBustAt: 0,
+    lastBustStatus: '',
+  };
+  restoreJailDiagnosticsFromStorage(jailDiagnostics);
+  let jailLatestEventMeta = { seq: 0, serverAtMs: 0, serverGapMs: -1, serverAgeMs: -1, nearCadence: false, refreshSource: 'unknown', receivedPerf: 0, hidden: false };
 
   const requestLimiter = {
     tokens: REQUEST_BURST_CAPACITY,
@@ -281,6 +434,8 @@
   }
 
   ensureDeviceIdentity();
+  window.addEventListener('pagehide', persistReloadState, { capture: true });
+  window.addEventListener('beforeunload', persistReloadState, { capture: true });
   createPanel();
   startRestartWatcher();
   startSchedulerWatchdog();
@@ -320,7 +475,6 @@
     token = '';
     tokenExpiresAt = 0;
     state.licenceFeatures.clear();
-    state.fastJailEngine = false;
     state.licenceCode = String(error?.code || 'disabled');
     state.licenceStatus = friendly(error);
     state.licenceError = true;
@@ -330,6 +484,7 @@
     }
     stopAutomation();
     stopJailStream();
+    void stopSecondaryJailStream({ logout: true });
     closePlannerSocket('licence rejected', true);
     log(`Licence disabled: ${state.licenceStatus}`, 'error');
     render();
@@ -364,7 +519,6 @@
         });
         token = String(data.token || '');
         tokenExpiresAt = Number(data.expiresAt) || 0;
-        applySessionLicenceFeatures(data);
         applyVersionInfo(data);
         state.licenceCode = '';
         state.licenceStatus = `Licence active · ${GM_getValue(KEYS.deviceLabel, 'Browser')}`;
@@ -853,6 +1007,12 @@
         <section class="ul-simple-tab-panel" data-tab-panel="logs" role="tabpanel" hidden>
           <div class="ul-simple-section-title">Migration status</div>
           <div class="ul-simple-pacing">Full licensed build active. Credentials and restart usernames stay local; gameplay planning is requested from your Cloudflare Worker. No downloaded code or eval is used.</div>
+          <div id="ul-simple-jail-diag-wrap" hidden>
+            <div class="ul-simple-section-title">Jail diagnostics</div>
+            <div class="ul-simple-login-settings-actions"><button type="button" id="ul-simple-jail-diag-copy">Copy jail diagnostics</button><button type="button" id="ul-simple-jail-diag-reset">Reset diagnostics</button><button type="button" id="ul-simple-jail-secondary-toggle">Start secondary jail stream</button></div>
+            <div id="ul-simple-jail-secondary-status" class="ul-simple-note">Secondary stream off · optional owner-only test using one additional normal game session.</div>
+            <div class="ul-simple-note">Private fast-jail troubleshooting counters. No licence capabilities are shown to standard users.</div>
+          </div>
           <div class="ul-simple-section-title">Recent activity</div>
           <div id="ul-simple-last">None yet</div>
           <div id="ul-simple-logs"></div>
@@ -881,6 +1041,11 @@
       .ul-simple-qt-label{display:block;margin:6px 0;color:#bbb}.ul-simple-qt-label input,.ul-simple-qt-label select{display:block;width:100%;padding:6px;color:#eee;background:#0a0d0f;border:1px solid #46515b;border-radius:5px}.ul-simple-qt-note{color:#aaa;font-size:11px;margin:7px 0}.ul-simple-qt-rule{padding:7px 0;border-bottom:1px solid #444;overflow-wrap:anywhere}.ul-simple-qt-rule small{display:block;margin:4px 0}.ul-simple-qt-rule button{margin-right:5px}#ul-simple-qt-status{color:#ffd36b;margin:8px 0;overflow-wrap:anywhere}.ul-simple-pacing{color:#bbb;margin-bottom:12px}#ul-simple-last{padding:7px;background:#0f1316;border:1px solid #303840;border-radius:6px;color:#ddd}#ul-simple-logs{max-height:280px;overflow:auto;margin-top:6px;padding-right:2px;color:#aaa}.ul-simple-log{padding:2px 0;border-bottom:1px dotted #333}.ul-simple-log.ok{color:#91df91}.ul-simple-log.warn{color:#ffd36b}.ul-simple-log.error{color:#ff9090}
     `;
     document.head.appendChild(style);
+    if (state.collapsed) host.classList.add('collapsed');
+    const initialBody = host.querySelector('#ul-simple-body');
+    if (initialBody) initialBody.hidden = state.collapsed;
+    const initialCollapse = host.querySelector('#ul-simple-collapse');
+    if (initialCollapse) initialCollapse.textContent = state.collapsed ? '+' : '−';
     document.body.appendChild(host);
     bindPanel(host);
     render();
@@ -1143,9 +1308,46 @@
       saveSettings();
       stopAutomation();
       stopJailStream();
+      void stopSecondaryJailStream({ logout: true });
       state.licenceStatus='Licence cleared';
       state.licenceError=true;
       render();
+    });
+
+    host.querySelector('#ul-simple-jail-diag-copy').addEventListener('click', async () => {
+      if (!hasFeature(LICENCE_FEATURE.FAST_JAIL_STREAM)) return;
+      const text = formatJailDiagnostics();
+      try {
+        await navigator.clipboard.writeText(text);
+        log('Copied jail diagnostics', 'ok');
+      } catch {
+        window.prompt('Copy jail diagnostics', text);
+      }
+    });
+    host.querySelector('#ul-simple-jail-diag-reset').addEventListener('click', () => {
+      if (!hasFeature(LICENCE_FEATURE.FAST_JAIL_STREAM)) return;
+      resetJailDiagnostics();
+      log('Reset jail diagnostics', 'info');
+      renderLogs();
+    });
+    host.querySelector('#ul-simple-jail-secondary-toggle').addEventListener('click', async () => {
+      if (!hasFeature(LICENCE_FEATURE.FAST_JAIL_STREAM)) return;
+      if (jailSecondaryEnabled) {
+        await stopSecondaryJailStream({ logout: true });
+        log('Secondary jail stream stopped', 'info');
+      } else {
+        const ok = window.confirm('Start a second authenticated Jail stream? This creates one additional normal game session. The game keeps at most two sessions per account, so an older session on another device could be signed out.');
+        if (!ok) return;
+        try {
+          await startSecondaryJailStream();
+          log('Secondary jail stream enabled', 'ok');
+        } catch (error) {
+          jailDiagnostics.secondarySessionLoginErrors += 1;
+          log(`Secondary jail stream: ${friendlyGameError(error)}`, 'warn');
+          await stopSecondaryJailStream({ logout: false });
+        }
+      }
+      renderLogs();
     });
   }
 
@@ -1776,7 +1978,398 @@
   }
 
   function jailStreamShouldRun() {
-    return Boolean(automationAllowed() && state.settings.jailBust);
+    // Fast live-inmate SSE is a licence capability. Standard licences never
+    // open /api/jail/stream and use the normal /api/jail polling lane instead.
+    return Boolean(automationAllowed() && state.settings.jailBust && hasFeature(LICENCE_FEATURE.FAST_JAIL_STREAM));
+  }
+
+  function gmGameRequest(details) {
+    return new Promise((resolve, reject) => {
+      let request;
+      try {
+        request = GM_xmlhttpRequest({
+          ...details,
+          onload: (response) => resolve(response),
+          onerror: () => reject(new Error('Secondary game request failed.')),
+          ontimeout: () => reject(new Error('Secondary game request timed out.')),
+          onabort: () => reject(new Error('Secondary game request aborted.')),
+        });
+      } catch (error) {
+        reject(error);
+      }
+      return request;
+    });
+  }
+
+  function secondarySessionCookieFromHeaders(headers) {
+    const text = String(headers || '');
+    const match = text.match(/(?:^|\r?\n)set-cookie:\s*ug_session=([^;\r\n]+)/i);
+    return match ? decodeURIComponent(match[1].trim()) : '';
+  }
+
+  async function createSecondaryGameSession() {
+    if (!state.login.email || !state.login.password) {
+      throw new Error('Save your game login details first.');
+    }
+    jailDiagnostics.secondarySessionLoginAttempts += 1;
+    const response = await gmGameRequest({
+      method: 'POST',
+      url: new URL('/api/auth/login', location.origin).href,
+      anonymous: true,
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      data: JSON.stringify({ email: state.login.email, password: state.login.password }),
+      timeout: 15_000,
+    });
+    let body = {};
+    try { body = JSON.parse(String(response.responseText || '{}')); } catch {}
+    if (response.status < 200 || response.status >= 300) {
+      const error = new Error(body?.error || body?.message || `Secondary login HTTP ${response.status}`);
+      error.status = response.status;
+      error.body = body;
+      throw error;
+    }
+    const sessionToken = secondarySessionCookieFromHeaders(response.responseHeaders);
+    if (!sessionToken) throw new Error('Secondary login succeeded but Tampermonkey did not expose the session cookie.');
+    jailDiagnostics.secondarySessionLoginSuccess += 1;
+    return sessionToken;
+  }
+
+  async function logoutSecondaryGameSession(sessionToken) {
+    if (!sessionToken) return;
+    try {
+      await gmGameRequest({
+        method: 'POST',
+        url: new URL('/api/auth/logout', location.origin).href,
+        anonymous: true,
+        cookie: `ug_session=${sessionToken}`,
+        headers: { Accept: 'application/json' },
+        timeout: 10_000,
+      });
+    } catch {}
+  }
+
+  function scheduleSecondaryJailReconnect() {
+    if (!jailSecondaryEnabled || !jailStreamShouldRun() || !jailSecondaryToken || jailSecondaryReconnectTimer) return;
+    const delay = jailSecondaryReconnectDelayMs;
+    jailSecondaryReconnectDelayMs = Math.min(15_000, jailSecondaryReconnectDelayMs * 2);
+    jailSecondaryReconnectTimer = setTimeout(() => {
+      jailSecondaryReconnectTimer = null;
+      if (jailSecondaryEnabled && jailStreamShouldRun() && jailSecondaryToken) connectSecondaryJailStream();
+    }, delay);
+  }
+
+  function liveTargetSet(inmates) {
+    const targets = new Set();
+    for (const inmate of Array.isArray(inmates) ? inmates : []) {
+      const candidate = liveJailCandidateRecord(inmate);
+      if (candidate) targets.add(candidate.target);
+    }
+    return targets;
+  }
+
+  function mergedLiveJailInmates() {
+    const merged = new Map();
+    for (const inmates of [jailLatestStreamInmates, jailSecondaryLatestInmates]) {
+      for (const inmate of Array.isArray(inmates) ? inmates : []) {
+        const candidate = liveJailCandidateRecord(inmate);
+        if (!candidate || merged.has(candidate.target)) continue;
+        merged.set(candidate.target, inmate);
+      }
+    }
+    return [...merged.values()];
+  }
+
+  function recentJailAttempt(target, now = Date.now()) {
+    for (const [key, at] of jailRecentAttemptedTargets) {
+      if (now - at > 5_000) jailRecentAttemptedTargets.delete(key);
+    }
+    const at = jailRecentAttemptedTargets.get(target) || 0;
+    return at > 0 && now - at < 2_500;
+  }
+
+  function pruneJailTargetSightings(nowPerf = performance.now()) {
+    for (const [target, sighting] of jailTargetSightings) {
+      const lastAt = Math.max(Number(sighting?.primaryAt) || 0, Number(sighting?.secondaryAt) || 0, Number(sighting?.firstAt) || 0);
+      if (!lastAt || nowPerf - lastAt > 60_000) jailTargetSightings.delete(target);
+    }
+  }
+
+  function noteJailTargetSightings(streamName, inmates, receivedPerf = performance.now()) {
+    if (streamName !== 'primary' && streamName !== 'secondary') return;
+    pruneJailTargetSightings(receivedPerf);
+
+    // A bust token/username can appear in jail again later. v2.2.16 kept the
+    // old first-seen timestamp for up to 60 seconds, which made a later jail
+    // episode look tens of seconds old. Retire a sighting as soon as the target
+    // is absent from BOTH current stream snapshots, then treat a later return as
+    // a brand-new episode.
+    const currentTargets = liveTargetSet(inmates);
+    const otherTargets = streamName === 'primary'
+      ? liveTargetSet(jailSecondaryLatestInmates)
+      : liveTargetSet(jailLatestStreamInmates);
+    for (const target of jailTargetSightings.keys()) {
+      if (!currentTargets.has(target) && !otherTargets.has(target)) jailTargetSightings.delete(target);
+    }
+
+    for (const inmate of Array.isArray(inmates) ? inmates : []) {
+      const candidate = liveJailCandidateRecord(inmate);
+      if (!candidate) continue;
+      let sighting = jailTargetSightings.get(candidate.target);
+      if (!sighting) {
+        sighting = {
+          firstStream: streamName,
+          firstAt: receivedPerf,
+          firstHidden: document.visibilityState === 'hidden',
+          primaryAt: 0,
+          secondaryAt: 0,
+        };
+        jailTargetSightings.set(candidate.target, sighting);
+      }
+      if (streamName === 'primary' && !sighting.primaryAt) sighting.primaryAt = receivedPerf;
+      if (streamName === 'secondary' && !sighting.secondaryAt) sighting.secondaryAt = receivedPerf;
+    }
+  }
+
+  function streamSightingForTarget(target) {
+    const sighting = jailTargetSightings.get(target);
+    if (!sighting) return { firstStream: 'unknown', firstAt: 0, firstHidden: false, primaryAt: 0, secondaryAt: 0, leadMs: -1, leadStream: 'unknown' };
+    const primaryAt = Number(sighting.primaryAt) || 0;
+    const secondaryAt = Number(sighting.secondaryAt) || 0;
+    let leadMs = -1;
+    let leadStream = 'unknown';
+    if (primaryAt > 0 && secondaryAt > 0) {
+      leadMs = Math.abs(primaryAt - secondaryAt);
+      if (leadMs <= 5) leadStream = 'tie';
+      else leadStream = primaryAt < secondaryAt ? 'primary' : 'secondary';
+    }
+    return {
+      firstStream: sighting.firstStream || 'unknown',
+      firstAt: Number(sighting.firstAt) || 0,
+      firstHidden: sighting.firstHidden === true,
+      primaryAt,
+      secondaryAt,
+      leadMs,
+      leadStream,
+    };
+  }
+
+  function noteSecondaryLiveJailSnapshot(inmates) {
+    const nextTargets = liveTargetSet(inmates);
+    const primaryTargets = liveTargetSet(jailLatestStreamInmates);
+    const newlySeen = [];
+    for (const target of nextTargets) {
+      const isNew = jailSecondarySnapshotPrimed
+        ? !jailSecondaryPreviousTargets.has(target)
+        : !primaryTargets.has(target);
+      if (!isNew || recentJailAttempt(target)) continue;
+      newlySeen.push(target);
+      jailDiagnostics.secondaryFreshTargetsSeen += 1;
+      if (!primaryTargets.has(target)) jailDiagnostics.secondaryOnlyFreshTargetsSeen += 1;
+    }
+    if (newlySeen.length) {
+      const queued = new Set(jailLiveFreshTargets);
+      for (const target of newlySeen) {
+        if (!queued.has(target)) {
+          jailLiveFreshTargets.push(target);
+          queued.add(target);
+        }
+      }
+    }
+    jailSecondarySnapshotPrimed = true;
+    jailSecondaryPreviousTargets = nextTargets;
+    const allTargets = new Set([...nextTargets, ...primaryTargets]);
+    jailLiveFreshTargets = jailLiveFreshTargets.filter((target) => allTargets.has(target) && !recentJailAttempt(target));
+  }
+
+  function handleSecondaryJailSseEvent(eventName, dataText) {
+    if (!jailSecondaryEnabled || !jailStreamShouldRun()) return;
+    if (eventName === 'ready') {
+      jailSecondaryReady = true;
+      jailSecondaryReconnectDelayMs = 1_000;
+      jailDiagnostics.secondaryStreamReady += 1;
+      scheduleRuntimePersist();
+      renderLogs();
+      return;
+    }
+    if (eventName === 'superseded') {
+      jailDiagnostics.secondaryStreamErrors += 1;
+      if (jailSecondaryRequest?.abort) try { jailSecondaryRequest.abort(); } catch {}
+      jailSecondaryRequest = null;
+      jailSecondaryReady = false;
+      scheduleSecondaryJailReconnect();
+      return;
+    }
+    if (eventName !== 'inmates') return;
+    const eventReceivedPerf = performance.now();
+    try {
+      const payload = JSON.parse(String(dataText || '{}'));
+      if (!Array.isArray(payload.inmates)) return;
+      jailDiagnostics.secondaryInmateEvents += 1;
+      noteJailTargetSightings('secondary', payload.inmates, eventReceivedPerf);
+      jailSecondaryLatestInmates = payload.inmates;
+      noteSecondaryLiveJailSnapshot(payload.inmates);
+      scheduleRuntimePersist();
+      void processLiveJailSnapshot();
+    } catch {}
+  }
+
+  async function consumeSecondaryJailStream(stream) {
+    if (!stream || typeof stream.getReader !== 'function') throw new Error('Tampermonkey stream API unavailable.');
+    const reader = stream.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let eventName = 'message';
+    let dataLines = [];
+    const dispatch = () => {
+      if (dataLines.length || eventName !== 'message') handleSecondaryJailSseEvent(eventName, dataLines.join('\n'));
+      eventName = 'message';
+      dataLines = [];
+    };
+    while (jailSecondaryEnabled && jailStreamShouldRun()) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let split;
+      while ((split = buffer.search(/\r?\n/)) !== -1) {
+        const line = buffer.slice(0, split);
+        const newlineLength = buffer[split] === '\r' && buffer[split + 1] === '\n' ? 2 : 1;
+        buffer = buffer.slice(split + newlineLength);
+        if (line === '') { dispatch(); continue; }
+        if (line.startsWith(':')) continue;
+        if (line.startsWith('event:')) eventName = line.slice(6).trim() || 'message';
+        else if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''));
+      }
+    }
+    try { reader.cancel(); } catch {}
+  }
+
+  async function ensureSecondaryGameSession() {
+    if (!jailSecondaryEnabled || jailSecondaryToken || jailSecondarySessionPromise) return jailSecondarySessionPromise;
+    jailSecondarySessionPromise = (async () => {
+      try {
+        const sessionToken = await createSecondaryGameSession();
+        if (!jailSecondaryEnabled) {
+          await logoutSecondaryGameSession(sessionToken);
+          return '';
+        }
+        jailSecondaryToken = sessionToken;
+        persistSecondaryJailState();
+        if (jailStreamShouldRun()) connectSecondaryJailStream();
+        return sessionToken;
+      } finally {
+        jailSecondarySessionPromise = null;
+      }
+    })();
+    return jailSecondarySessionPromise;
+  }
+
+  function invalidateSecondaryGameSession() {
+    jailSecondaryToken = '';
+    jailSecondaryReady = false;
+    persistSecondaryJailState();
+    if (jailSecondaryEnabled && jailStreamShouldRun()) {
+      void ensureSecondaryGameSession().catch((error) => {
+        jailDiagnostics.secondarySessionLoginErrors += 1;
+        log(`Secondary jail stream restore: ${friendlyGameError(error)}`, 'warn');
+      });
+    }
+  }
+
+  function connectSecondaryJailStream() {
+    if (!jailSecondaryEnabled || !jailStreamShouldRun() || !jailSecondaryToken || jailSecondaryRequest) return;
+    jailDiagnostics.secondaryStreamConnectAttempts += 1;
+    let started = false;
+    try {
+      jailSecondaryRequest = GM_xmlhttpRequest({
+        method: 'GET',
+        url: new URL('/api/jail/stream', location.origin).href,
+        anonymous: true,
+        cookie: `ug_session=${jailSecondaryToken}`,
+        headers: { Accept: 'text/event-stream' },
+        responseType: 'stream',
+        onloadstart: (response) => {
+          started = true;
+          if (response.status && response.status !== 200) {
+            jailDiagnostics.secondaryStreamErrors += 1;
+            if (jailSecondaryRequest?.abort) { try { jailSecondaryRequest.abort(); } catch {} }
+            jailSecondaryRequest = null;
+            jailSecondaryReady = false;
+            if (response.status === 401 || response.status === 403) invalidateSecondaryGameSession();
+            else scheduleSecondaryJailReconnect();
+            scheduleRuntimePersist();
+            return;
+          }
+          void consumeSecondaryJailStream(response.response).catch(() => {
+            if (!jailSecondaryEnabled) return;
+            jailDiagnostics.secondaryStreamErrors += 1;
+            jailSecondaryRequest = null;
+            jailSecondaryReady = false;
+            scheduleSecondaryJailReconnect();
+          });
+        },
+        onload: () => {
+          jailSecondaryRequest = null;
+          jailSecondaryReady = false;
+          if (jailSecondaryEnabled) scheduleSecondaryJailReconnect();
+        },
+        onerror: () => {
+          jailDiagnostics.secondaryStreamErrors += 1;
+          jailSecondaryRequest = null;
+          jailSecondaryReady = false;
+          if (jailSecondaryEnabled) scheduleSecondaryJailReconnect();
+        },
+        onabort: () => {
+          jailSecondaryRequest = null;
+          jailSecondaryReady = false;
+        },
+      });
+    } catch (error) {
+      jailDiagnostics.secondaryStreamErrors += 1;
+      jailSecondaryRequest = null;
+      jailSecondaryReady = false;
+      if (started) scheduleSecondaryJailReconnect();
+      throw error;
+    }
+  }
+
+  async function startSecondaryJailStream() {
+    if (!hasFeature(LICENCE_FEATURE.FAST_JAIL_STREAM)) throw new Error('Fast jail is not enabled.');
+    if (jailSecondaryEnabled && jailSecondaryToken) {
+      syncJailStream();
+      return;
+    }
+    jailSecondaryEnabled = true;
+    jailSecondaryReconnectDelayMs = 1_000;
+    persistSecondaryJailState();
+    try {
+      if (!jailSecondaryToken) await ensureSecondaryGameSession();
+      if (jailSecondaryToken && jailStreamShouldRun()) connectSecondaryJailStream();
+      persistSecondaryJailState();
+    } catch (error) {
+      jailSecondaryEnabled = false;
+      jailSecondaryToken = '';
+      persistSecondaryJailState();
+      throw error;
+    }
+  }
+
+  async function stopSecondaryJailStream({ logout = false } = {}) {
+    jailSecondaryEnabled = false;
+    jailSecondaryReady = false;
+    if (jailSecondaryReconnectTimer) clearTimeout(jailSecondaryReconnectTimer);
+    jailSecondaryReconnectTimer = null;
+    if (jailSecondaryRequest?.abort) {
+      try { jailSecondaryRequest.abort(); } catch {}
+    }
+    jailSecondaryRequest = null;
+    jailSecondaryLatestInmates = [];
+    jailSecondarySnapshotPrimed = false;
+    jailSecondaryPreviousTargets = new Set();
+    const oldToken = jailSecondaryToken;
+    jailSecondaryToken = '';
+    jailTargetSightings.clear();
+    persistSecondaryJailState();
+    if (logout && oldToken) await logoutSecondaryGameSession(oldToken);
   }
 
   function stopJailStream() {
@@ -1790,25 +2383,31 @@
     }
     jailStreamReady = false;
     jailLatestStreamInmates = [];
+    jailLiveSnapshotPrimed = false;
+    jailLivePreviousTargets = new Set();
+    jailLiveFreshTargets = [];
+    if (jailSecondaryRequest?.abort) { try { jailSecondaryRequest.abort(); } catch {} }
+    jailSecondaryRequest = null;
+    jailSecondaryReady = false;
+    jailSecondaryLatestInmates = [];
+    jailSecondarySnapshotPrimed = false;
+    jailSecondaryPreviousTargets = new Set();
   }
 
-  function syncLegacyJailStream() {
+  function syncJailStream() {
     if (!jailStreamShouldRun()) {
       stopJailStream();
       return;
     }
-    if (jailEventSource || jailReconnectTimer) return;
-    connectJailStream();
-  }
-
-  function syncJailStream() {
-    // Licence selection happens outside the known-good v2.2.2 stream engine.
-    // Standard licences never enter the SSE engine at all.
-    if (!state.fastJailEngine) {
-      stopJailStream();
-      return;
+    if (!jailEventSource && !jailReconnectTimer) connectJailStream();
+    if (jailSecondaryEnabled && !jailSecondaryToken) {
+      void ensureSecondaryGameSession().catch((error) => {
+        jailDiagnostics.secondarySessionLoginErrors += 1;
+        log(`Secondary jail stream restore: ${friendlyGameError(error)}`, 'warn');
+      });
+    } else if (jailSecondaryEnabled && jailSecondaryToken && !jailSecondaryRequest && !jailSecondaryReconnectTimer) {
+      connectSecondaryJailStream();
     }
-    syncLegacyJailStream();
   }
 
   function scheduleJailStreamReconnect() {
@@ -1824,6 +2423,7 @@
   function connectJailStream() {
     if (!jailStreamShouldRun() || jailEventSource) return;
     let source;
+    jailDiagnostics.streamConnectAttempts += 1;
     try {
       source = new EventSource(new URL('/api/jail/stream', location.origin).href);
     } catch (error) {
@@ -1835,28 +2435,87 @@
     jailEventSource = source;
     source.addEventListener('ready', () => {
       if (jailEventSource !== source) return;
+      jailDiagnostics.streamReady += 1;
       jailStreamReady = true;
       jailStreamReconnectDelayMs = 1_000;
       state.jailStatus = state.inJail ? 'Live jail stream connected · waiting for release' : 'Live jail stream connected · watching inmates';
+      scheduleRuntimePersist();
       render();
     });
     source.addEventListener('inmates', (event) => {
+      const eventReceivedPerf = performance.now();
       if (jailEventSource !== source || !jailStreamShouldRun()) return;
       try {
         const payload = JSON.parse(String(event.data || '{}'));
         if (!Array.isArray(payload.inmates)) return;
-        jailLatestStreamInmates = payload.inmates;
-        if (state.settings.discoverPlayers) {
-          addDiscoveredPlayers(
-            payload.inmates.filter((row) => row && row.isBot !== true && row.usernameHidden !== true).map((row) => row.username),
-            'Jail'
-          );
+        const refreshSource = payload.refreshSource === 'signal' || payload.refreshSource === 'watch' || payload.refreshSource === 'initial'
+          ? payload.refreshSource
+          : 'unknown';
+        jailDiagnostics.inmateEvents += 1;
+        if (refreshSource === 'signal') jailDiagnostics.inmateSourceSignal += 1;
+        else if (refreshSource === 'watch') jailDiagnostics.inmateSourceWatch += 1;
+        else if (refreshSource === 'initial') jailDiagnostics.inmateSourceInitial += 1;
+        else jailDiagnostics.inmateSourceUnknown += 1;
+        jailDiagnostics.lastInmateEventAt = Date.now();
+        jailDiagnostics.lastInmateServerTime = String(payload.serverTime || '');
+        const serverAt = Date.parse(String(payload.serverTime || ''));
+        let serverAgeMs = -1;
+        let serverGapMs = -1;
+        let nearCadence = false;
+        if (Number.isFinite(serverAt)) {
+          serverAgeMs = Math.max(0, Date.now() - serverAt);
+          jailDiagnostics.inmateEventServerAgeSamples += 1;
+          jailDiagnostics.inmateEventServerAgeTotalMs += serverAgeMs;
+          jailDiagnostics.inmateEventServerAgeMaxMs = Math.max(jailDiagnostics.inmateEventServerAgeMaxMs, serverAgeMs);
+          if (jailDiagnostics.lastInmateServerAtMs > 0) {
+            serverGapMs = Math.max(0, serverAt - jailDiagnostics.lastInmateServerAtMs);
+            jailDiagnostics.inmateServerGapSamples += 1;
+            jailDiagnostics.inmateServerGapTotalMs += serverGapMs;
+            jailDiagnostics.inmateServerGapMinMs = jailDiagnostics.inmateServerGapMinMs > 0 ? Math.min(jailDiagnostics.inmateServerGapMinMs, serverGapMs) : serverGapMs;
+            jailDiagnostics.inmateServerGapMaxMs = Math.max(jailDiagnostics.inmateServerGapMaxMs, serverGapMs);
+            if (serverGapMs < 250) jailDiagnostics.inmateGapLt250 += 1;
+            else if (serverGapMs < 750) jailDiagnostics.inmateGap250To749 += 1;
+            else if (serverGapMs < 1250) jailDiagnostics.inmateGap750To1249 += 1;
+            else if (serverGapMs < 2250) jailDiagnostics.inmateGap1250To2249 += 1;
+            else jailDiagnostics.inmateGap2250Plus += 1;
+            const nearestWholeSecond = Math.max(1, Math.round(serverGapMs / 1000)) * 1000;
+            nearCadence = serverGapMs >= 700 && Math.abs(serverGapMs - nearestWholeSecond) <= 160;
+            if (nearCadence) jailDiagnostics.inmateGapNearWholeSecond += 1;
+          }
+          jailDiagnostics.lastInmateServerAtMs = serverAt;
         }
+        jailDiagnostics.eventSequence += 1;
+        jailLatestEventMeta = {
+          seq: jailDiagnostics.eventSequence,
+          serverAtMs: Number.isFinite(serverAt) ? serverAt : 0,
+          serverGapMs,
+          serverAgeMs,
+          nearCadence,
+          refreshSource,
+          receivedPerf: eventReceivedPerf,
+          hidden: document.visibilityState === 'hidden',
+        };
+        noteJailTargetSightings('primary', payload.inmates, eventReceivedPerf);
+        noteLiveJailSnapshot(payload.inmates);
+        jailLatestStreamInmates = payload.inmates;
+        scheduleRuntimePersist();
+
+        // Owner hot path first. Player-discovery persistence/rendering used to run
+        // synchronously before this call, delaying the actual bust request. Start
+        // the jail lane now and move all unrelated discovery/UI work to a later
+        // task so the fetch microtask can dispatch first.
         void processLiveJailSnapshot();
+        if (state.settings.discoverPlayers) {
+          const discoveredNames = payload.inmates
+            .filter((row) => row && row.isBot !== true && row.usernameHidden !== true)
+            .map((row) => row.username);
+          setTimeout(() => addDiscoveredPlayers(discoveredNames, 'Jail'), 0);
+        }
       } catch {}
     });
     source.addEventListener('superseded', () => {
       if (jailEventSource !== source) return;
+      jailDiagnostics.streamSuperseded += 1;
       source.close();
       jailEventSource = null;
       jailStreamReady = false;
@@ -1864,6 +2523,7 @@
     });
     source.onerror = () => {
       if (jailEventSource !== source) return;
+      jailDiagnostics.streamErrors += 1;
       try { source.close(); } catch {}
       jailEventSource = null;
       jailStreamReady = false;
@@ -1871,33 +2531,97 @@
     };
   }
 
-  function liveJailCandidate(inmates) {
+  function liveJailCandidateRecord(inmate) {
+    if (!inmate || inmate.isBot === true) return null;
     const viewerName = String(state.jailViewerUsername || '').trim().toLocaleLowerCase();
     const viewerToken = String(state.jailViewerBustToken || '').trim();
-    const candidates = [];
+    const username = String(inmate.username || '').trim();
+    const bustToken = String(inmate.bustToken || '').trim();
+    const target = bustToken || username;
+    if (!target || target.length > 64) return null;
+    if (viewerToken && bustToken && viewerToken === bustToken) return null;
+    if (!inmate.usernameHidden && viewerName && username.toLocaleLowerCase() === viewerName) return null;
+    let reward = 0n;
+    try { if (/^\d{1,36}$/.test(String(inmate.bustReward ?? ''))) reward = BigInt(String(inmate.bustReward)); } catch {}
+    const seconds = Number.isFinite(Number(inmate.secondsRemaining)) ? Math.max(0, Number(inmate.secondsRemaining)) : 86_400;
+    return { inmate, target, reward, seconds };
+  }
+
+  function noteLiveJailSnapshot(inmates) {
+    const nextTargets = new Set();
+    const newlySeen = [];
     for (const inmate of Array.isArray(inmates) ? inmates : []) {
-      if (!inmate || inmate.isBot === true) continue;
-      const username = String(inmate.username || '').trim();
-      const bustToken = String(inmate.bustToken || '').trim();
-      const target = bustToken || username;
-      if (!target || target.length > 64) continue;
-      if (viewerToken && bustToken && viewerToken === bustToken) continue;
-      if (!inmate.usernameHidden && viewerName && username.toLocaleLowerCase() === viewerName) continue;
-      let reward = 0n;
-      try { if (/^\d{1,36}$/.test(String(inmate.bustReward ?? ''))) reward = BigInt(String(inmate.bustReward)); } catch {}
-      const seconds = Number.isFinite(Number(inmate.secondsRemaining)) ? Math.max(0, Number(inmate.secondsRemaining)) : 86_400;
-      candidates.push({ inmate, target, reward, seconds });
+      const candidate = liveJailCandidateRecord(inmate);
+      if (!candidate) continue;
+      nextTargets.add(candidate.target);
+      if (jailLiveSnapshotPrimed && !jailLivePreviousTargets.has(candidate.target)) newlySeen.push(candidate.target);
     }
-    candidates.sort((a, b) => a.reward !== b.reward ? (a.reward > b.reward ? -1 : 1) : a.seconds - b.seconds);
-    return candidates[0] || null;
+
+    if (jailLiveSnapshotPrimed && newlySeen.length) {
+      const queued = new Set(jailLiveFreshTargets);
+      for (const target of newlySeen) {
+        if (recentJailAttempt(target)) continue;
+        jailDiagnostics.liveFreshTargetsSeen += 1;
+        if (!queued.has(target)) {
+          jailLiveFreshTargets.push(target);
+          queued.add(target);
+        }
+      }
+    }
+
+    jailLiveSnapshotPrimed = true;
+    jailLivePreviousTargets = nextTargets;
+    // Keep a target while either authenticated stream still sees it.
+    const secondaryTargets = liveTargetSet(jailSecondaryLatestInmates);
+    jailLiveFreshTargets = jailLiveFreshTargets.filter((target) => (nextTargets.has(target) || secondaryTargets.has(target)) && !recentJailAttempt(target));
+  }
+
+  function liveJailCandidate(inmates) {
+    const candidates = [];
+    const byTarget = new Map();
+    for (const inmate of Array.isArray(inmates) ? inmates : []) {
+      const candidate = liveJailCandidateRecord(inmate);
+      if (!candidate || recentJailAttempt(candidate.target)) continue;
+      candidates.push(candidate);
+      byTarget.set(candidate.target, candidate);
+    }
+    if (!candidates.length) return null;
+
+    // Count is the goal on the private fast lane. When multiple choices exist,
+    // deliberately avoid the conventional highest-reward/shortest-sentence
+    // target that competing automation is most likely to choose.
+    const collisionOrder = (a, b) => a.reward !== b.reward
+      ? (a.reward < b.reward ? -1 : 1)
+      : b.seconds - a.seconds;
+
+    const fresh = [];
+    const retainedFreshTargets = [];
+    for (const target of jailLiveFreshTargets) {
+      const candidate = byTarget.get(target);
+      if (!candidate) continue;
+      retainedFreshTargets.push(target);
+      fresh.push(candidate);
+    }
+    jailLiveFreshTargets = retainedFreshTargets;
+
+    if (fresh.length) {
+      fresh.sort(collisionOrder);
+      return { ...fresh[0], freshSelection: true, candidateCount: candidates.length };
+    }
+
+    candidates.sort(collisionOrder);
+    return { ...candidates[0], freshSelection: false, candidateCount: candidates.length };
   }
 
   async function processLiveJailSnapshot() {
-    if (!jailStreamShouldRun() || state.inJail || state.jailBustRunning) return;
-    const candidate = liveJailCandidate(jailLatestStreamInmates);
-    if (!candidate) return;
-    const rateWait = Math.max(0, state.lastJailBustAt + JAIL_BUST_MIN_INTERVAL_MS - Date.now());
+    if (!jailStreamShouldRun()) return;
+    if (state.inJail) { jailDiagnostics.liveSnapshotsBlockedInJail += 1; return; }
+    if (state.jailBustRunning) { jailDiagnostics.liveSnapshotsBlockedBusy += 1; return; }
+    const candidate = liveJailCandidate(mergedLiveJailInmates());
+    if (!candidate) { jailDiagnostics.liveSnapshotsNoCandidate += 1; return; }
+    const rateWait = Math.max(0, state.lastJailBustAt + FAST_JAIL_BUST_MIN_INTERVAL_MS - Date.now());
     if (rateWait > 0) {
+      jailDiagnostics.liveSnapshotsRateDeferred += 1;
       if (!jailStreamBustTimer) {
         jailStreamBustTimer = setTimeout(() => {
           jailStreamBustTimer = null;
@@ -1909,22 +2633,160 @@
 
     state.jailBustRunning = true;
     markFeatureEpoch('jail');
+    jailDiagnostics.liveBustAttempts += 1;
+    jailRecentAttemptedTargets.set(candidate.target, Date.now());
+    const primaryTargetsAtDispatch = liveTargetSet(jailLatestStreamInmates);
+    const secondaryTargetsAtDispatch = liveTargetSet(jailSecondaryLatestInmates);
+    const primarySeenAtDispatch = primaryTargetsAtDispatch.has(candidate.target);
+    const secondarySeenAtDispatch = secondaryTargetsAtDispatch.has(candidate.target);
+    const secondaryOnlySelection = !primarySeenAtDispatch && secondarySeenAtDispatch;
+    const primaryOnlySelection = primarySeenAtDispatch && !secondarySeenAtDispatch;
+    const bothSeenSelection = primarySeenAtDispatch && secondarySeenAtDispatch;
+    const streamSighting = streamSightingForTarget(candidate.target);
+    if (secondaryOnlySelection) jailDiagnostics.secondaryOnlySelections += 1;
+    if (primaryOnlySelection) jailDiagnostics.primaryOnlySelections += 1;
+    if (bothSeenSelection) jailDiagnostics.bothSeenSelections += 1;
+    if (streamSighting.firstStream === 'primary') jailDiagnostics.firstSeenPrimarySelections += 1;
+    else if (streamSighting.firstStream === 'secondary') jailDiagnostics.firstSeenSecondarySelections += 1;
+    if (streamSighting.leadStream === 'primary') {
+      jailDiagnostics.primaryLeadSamples += 1;
+      jailDiagnostics.primaryLeadTotalMs += streamSighting.leadMs;
+      jailDiagnostics.primaryLeadMaxMs = Math.max(jailDiagnostics.primaryLeadMaxMs, streamSighting.leadMs);
+    } else if (streamSighting.leadStream === 'secondary') {
+      jailDiagnostics.secondaryLeadSamples += 1;
+      jailDiagnostics.secondaryLeadTotalMs += streamSighting.leadMs;
+      jailDiagnostics.secondaryLeadMaxMs = Math.max(jailDiagnostics.secondaryLeadMaxMs, streamSighting.leadMs);
+    } else if (streamSighting.leadStream === 'tie') {
+      jailDiagnostics.streamLeadTies += 1;
+    }
+    if (candidate.freshSelection) {
+      jailDiagnostics.liveFreshSelections += 1;
+      jailLiveFreshTargets = jailLiveFreshTargets.filter((target) => target !== candidate.target);
+    } else {
+      jailDiagnostics.liveFallbackSelections += 1;
+    }
+    if (candidate.candidateCount > 1) jailDiagnostics.liveMultiCandidateSelections += 1;
+    const diagnosticBustStartedAt = performance.now();
+    const eventMeta = { ...jailLatestEventMeta };
+    const trace = {
+      seq: eventMeta.seq,
+      gapMs: eventMeta.serverGapMs,
+      ageMs: eventMeta.serverAgeMs,
+      cadence: eventMeta.nearCadence ? 'near1s' : 'off',
+      source: eventMeta.refreshSource || 'unknown',
+      firstStream: streamSighting.firstStream || 'unknown',
+      leadMs: streamSighting.leadMs,
+      hidden: streamSighting.firstAt > 0 ? (streamSighting.firstHidden ? 1 : 0) : (eventMeta.hidden ? 1 : 0),
+      eventToDispatchMs: 0,
+      candidates: candidate.candidateCount,
+      fresh: candidate.freshSelection ? 1 : 0,
+      outcome: 'pending',
+      networkMs: 0,
+    };
+    jailDiagnostics.attemptTrace.push(trace);
+    if (jailDiagnostics.attemptTrace.length > 80) jailDiagnostics.attemptTrace.splice(0, jailDiagnostics.attemptTrace.length - 80);
+    if (eventMeta.nearCadence) jailDiagnostics.attemptNearCadence += 1;
+    else jailDiagnostics.attemptOffCadence += 1;
+    if (trace.source === 'signal') jailDiagnostics.attemptSourceSignal += 1;
+    else if (trace.source === 'watch') jailDiagnostics.attemptSourceWatch += 1;
+    else if (trace.source === 'initial') jailDiagnostics.attemptSourceInitial += 1;
+    else jailDiagnostics.attemptSourceUnknown += 1;
+    if (trace.hidden) jailDiagnostics.attemptHidden += 1;
+    else jailDiagnostics.attemptVisible += 1;
     const inmate = candidate.inmate;
     const displayName = inmate?.usernameHidden ? 'Unknown' : String(inmate?.username || 'player');
-    state.currentAction = `Busting ${displayName}`;
-    state.jailStatus = `Live stream · ${state.currentAction}`;
-    render();
     state.lastJailBustAt = Date.now();
+
+    // Ultra-fast owner lane: do not render or enqueue through the generic
+    // mutation-tail before the request. The live lane intentionally has no
+    // artificial 205 ms spacing: gameJsonDirect's jailBust bucket still caps
+    // dispatches at 5 per rolling second, while jailBustRunning keeps requests
+    // sequential so the server never sees overlapping actions from this lane.
+    const dispatchPrepMs = Math.max(0, performance.now() - diagnosticBustStartedAt);
+    jailDiagnostics.liveDispatchPrepSamples += 1;
+    jailDiagnostics.liveDispatchPrepTotalMs += dispatchPrepMs;
+    jailDiagnostics.liveDispatchPrepMaxMs = Math.max(jailDiagnostics.liveDispatchPrepMaxMs, dispatchPrepMs);
+
     try {
-      const result = await gameJson(`/api/jail/bust/${encodeURIComponent(candidate.target)}`, { method: 'POST' });
-      log(cleanGameMessage(result?.html) || `Busted ${displayName}`, result?.success === false ? 'warn' : 'ok');
+      const firstSeenPerf = streamSighting.firstAt > 0 ? streamSighting.firstAt : eventMeta.receivedPerf;
+      const eventToDispatchMs = firstSeenPerf > 0 ? Math.max(0, performance.now() - firstSeenPerf) : 0;
+      trace.eventToDispatchMs = eventToDispatchMs;
+      if (firstSeenPerf > 0) {
+        jailDiagnostics.liveEventToDispatchSamples += 1;
+        jailDiagnostics.liveEventToDispatchTotalMs += eventToDispatchMs;
+        jailDiagnostics.liveEventToDispatchMaxMs = Math.max(jailDiagnostics.liveEventToDispatchMaxMs, eventToDispatchMs);
+      }
+      const result = await gameJsonDirect(`/api/jail/bust/${encodeURIComponent(candidate.target)}`, {
+        method: 'POST',
+        priority: REQUEST_PRIORITY.ACTION,
+        // If the 5/sec safety bucket has to hold this request, do not spend the
+        // next available slot on a target that disappeared while queued.
+        validate: () => {
+          const stillPresent = mergedLiveJailInmates().some((row) => String(row?.bustToken || row?.username || '').trim() === candidate.target);
+          if (!stillPresent) {
+            jailDiagnostics.liveQueuedTargetDropped += 1;
+            trace.outcome = 'queue-stale';
+            throw new ActionCancelledError('Queued jail target is no longer present');
+          }
+        },
+      });
+      if (result?.success === false) {
+        jailDiagnostics.liveBustOtherErrors += 1;
+        trace.outcome = 'response-false';
+      } else {
+        jailDiagnostics.liveBustSuccess += 1;
+        if (secondaryOnlySelection) jailDiagnostics.secondaryOnlySuccess += 1;
+        if (primaryOnlySelection) jailDiagnostics.primaryOnlySuccess += 1;
+        if (bothSeenSelection) jailDiagnostics.bothSeenSuccess += 1;
+        if (streamSighting.firstStream === 'primary') jailDiagnostics.firstSeenPrimarySuccess += 1;
+        else if (streamSighting.firstStream === 'secondary') jailDiagnostics.firstSeenSecondarySuccess += 1;
+        trace.outcome = 'success';
+        if (eventMeta.nearCadence) jailDiagnostics.successNearCadence += 1;
+        else jailDiagnostics.successOffCadence += 1;
+        if (trace.source === 'signal') jailDiagnostics.successSourceSignal += 1;
+        else if (trace.source === 'watch') jailDiagnostics.successSourceWatch += 1;
+        else if (trace.source === 'initial') jailDiagnostics.successSourceInitial += 1;
+        else jailDiagnostics.successSourceUnknown += 1;
+        if (trace.hidden) jailDiagnostics.successHidden += 1;
+        else jailDiagnostics.successVisible += 1;
+      }
+      jailDiagnostics.lastBustStatus = result?.success === false ? 'response-success-false' : 'success';
+      jailDiagnostics.lastBustAt = Date.now();
+      state.currentAction = `Busted ${displayName}`;
+      state.jailStatus = `Live stream · ${state.currentAction}`;
+      const resultHtml = result?.html;
+      const resultWasFalse = result?.success === false;
+      setTimeout(() => log(cleanGameMessage(resultHtml) || `Busted ${displayName}`, resultWasFalse ? 'warn' : 'ok'), 0);
       jailLatestStreamInmates = jailLatestStreamInmates.filter((row) => String(row?.bustToken || row?.username || '').trim() !== candidate.target);
+      jailSecondaryLatestInmates = jailSecondaryLatestInmates.filter((row) => String(row?.bustToken || row?.username || '').trim() !== candidate.target);
+      jailLiveFreshTargets = jailLiveFreshTargets.filter((target) => target !== candidate.target);
       state.jailBustDueAt = Math.max(state.jailBustDueAt, state.lastJailBustAt + JAIL_BUST_MIN_INTERVAL_MS);
     } catch (error) {
       if (error instanceof ActionCancelledError) return;
       const message = friendlyGameError(error);
       const gotCaught = error?.body?.success === false || /got caught trying to bust|cannot bust players while you are in jail/i.test(message);
       const stale = error?.status === 404 || (error?.status === 400 && /not in jail|no longer in jail|dead|not found/i.test(message));
+      if (gotCaught) { jailDiagnostics.liveBustCaught += 1; trace.outcome = 'caught'; }
+      else if (error?.status === 429) { jailDiagnostics.liveBust429 += 1; trace.outcome = '429'; }
+      else if (stale) {
+        jailDiagnostics.liveBustStale += 1;
+        if (secondaryOnlySelection) jailDiagnostics.secondaryOnlyStale += 1;
+        if (primaryOnlySelection) jailDiagnostics.primaryOnlyStale += 1;
+        if (bothSeenSelection) jailDiagnostics.bothSeenStale += 1;
+        if (streamSighting.firstStream === 'primary') jailDiagnostics.firstSeenPrimaryStale += 1;
+        else if (streamSighting.firstStream === 'secondary') jailDiagnostics.firstSeenSecondaryStale += 1;
+        trace.outcome = 'stale';
+        if (eventMeta.nearCadence) jailDiagnostics.staleNearCadence += 1;
+        else jailDiagnostics.staleOffCadence += 1;
+        if (trace.source === 'signal') jailDiagnostics.staleSourceSignal += 1;
+        else if (trace.source === 'watch') jailDiagnostics.staleSourceWatch += 1;
+        else if (trace.source === 'initial') jailDiagnostics.staleSourceInitial += 1;
+        else jailDiagnostics.staleSourceUnknown += 1;
+        if (trace.hidden) jailDiagnostics.staleHidden += 1;
+        else jailDiagnostics.staleVisible += 1;
+      } else { jailDiagnostics.liveBustOtherErrors += 1; trace.outcome = `error-${Number(error?.status) || 0}`; }
+      jailDiagnostics.lastBustStatus = gotCaught ? 'caught' : error?.status === 429 ? '429' : stale ? 'stale' : `error-${Number(error?.status) || 0}`;
+      jailDiagnostics.lastBustAt = Date.now();
       if (gotCaught) {
         markJailed();
         state.crimesDueAt = Date.now() + CRIME_JAIL_POLL_MS;
@@ -1941,209 +2803,42 @@
         state.jailStatus = `Jailbust rate pacing · ${formatWait(wait)}`;
       } else if (stale) {
         jailLatestStreamInmates = jailLatestStreamInmates.filter((row) => String(row?.bustToken || row?.username || '').trim() !== candidate.target);
-      } else if (!stale) {
+        jailSecondaryLatestInmates = jailSecondaryLatestInmates.filter((row) => String(row?.bustToken || row?.username || '').trim() !== candidate.target);
+        jailLiveFreshTargets = jailLiveFreshTargets.filter((target) => target !== candidate.target);
+      } else {
         state.jailStatus = `Live jailbust failed: ${message}`;
         log(`Jailbust: ${message}`, 'error');
       }
     } finally {
+      const diagnosticBustRoundTrip = Math.max(0, performance.now() - diagnosticBustStartedAt);
+      trace.networkMs = Math.round(diagnosticBustRoundTrip);
+      jailDiagnostics.liveBustRoundTripSamples += 1;
+      jailDiagnostics.liveBustRoundTripTotalMs += diagnosticBustRoundTrip;
+      jailDiagnostics.liveBustRoundTripMaxMs = Math.max(jailDiagnostics.liveBustRoundTripMaxMs, diagnosticBustRoundTrip);
+      // Successful/stale/caught/queue-stale attempts end this target's current
+      // jail episode. Drop its timing record immediately so a later re-jail of
+      // the same player cannot inherit an old first-seen timestamp.
+      if (trace.outcome === 'success' || trace.outcome === 'stale' || trace.outcome === 'caught' || trace.outcome === 'queue-stale') {
+        jailTargetSightings.delete(candidate.target);
+      }
+      scheduleRuntimePersist();
       state.jailBustRunning = false;
+      // Drain another currently-visible real inmate before repainting the UI.
+      // The request bucket below gameJsonDirect provides the 5/sec safety cap;
+      // skipping an intermediate render removes avoidable race latency when
+      // inmates arrive in a cluster.
+      const canContinueBurst = trace.outcome === 'success' || trace.outcome === 'stale' || trace.outcome === 'queue-stale';
+      if (canContinueBurst && !state.inJail && liveJailCandidate(mergedLiveJailInmates())) {
+        jailDiagnostics.liveBurstContinuations += 1;
+        void processLiveJailSnapshot();
+        return;
+      }
       render();
       wakeAutomation();
-      if (!state.inJail && jailLatestStreamInmates.length) {
-        const wait = Math.max(0, state.lastJailBustAt + JAIL_BUST_MIN_INTERVAL_MS - Date.now());
-        if (jailStreamBustTimer) clearTimeout(jailStreamBustTimer);
-        jailStreamBustTimer = setTimeout(() => {
-          jailStreamBustTimer = null;
-          void processLiveJailSnapshot();
-        }, Math.max(1, wait));
-      }
     }
   }
 
-
-  async function runJailBustLegacyFast() {
-    if (!automationAllowed() || (!state.settings.jailBust && !state.inJail) || state.jailBustRunning) return;
-    state.jailBustRunning = true;
-    if (state.settings.jailBust) markFeatureEpoch('jail');
-    state.currentAction = state.inJail ? 'Checking jail sentence' : 'Checking jail for busts';
-    state.jailStatus = state.currentAction;
-    render();
-    try {
-      const page = await gameJson('/api/jail', { priority: REQUEST_PRIORITY.RAPID });
-      if (!automationAllowed()) return;
-
-      const wasInJail = state.inJail;
-      if (page?.inJail === true) {
-        markJailed();
-      } else if (wasInJail) {
-        const released = await confirmJailRelease();
-        if (released) {
-          log('Released from jail — resuming actions', 'ok');
-          state.crimesDueAt = 0;
-          state.gtaDueAt = 0;
-          state.meltDueAt = 0;
-          state.drugsDueAt = 0;
-          state.autoRankDueAt = 0;
-          state.prestigeDueAt = 0;
-          state.autoGunDueAt = 0;
-          state.playerSearchDueAt = 0;
-          state.combatDueAt = 0;
-          state.qtDueAt = 0;
-          if (state.settings.jailBust && jailLatestStreamInmates.length) void processLiveJailSnapshot();
-        }
-      }
-
-      if (state.inJail) {
-        state.jailBustDueAt = Date.now() + JAIL_RELEASE_POLL_MS;
-        state.currentAction = 'Paused while in jail';
-        state.jailStatus = `In jail · checking release in ${formatWait(JAIL_RELEASE_POLL_MS)}`;
-        return;
-      }
-
-      // If Jailbust is disabled, this lane exists only to confirm release.
-      if (!state.settings.jailBust) {
-        state.jailBustDueAt = Infinity;
-        state.jailStatus = 'Jailbust disabled';
-        return;
-      }
-
-      const viewerUsername = String(page?.viewerUsername || '').trim();
-      const viewerBustToken = String(page?.viewerBustToken || '').trim();
-      state.jailViewerUsername = viewerUsername;
-      state.jailViewerBustToken = viewerBustToken;
-      const inmates = (Array.isArray(page?.inmates) ? page.inmates : []).slice(0, 100);
-      if (state.settings.discoverPlayers) {
-        addDiscoveredPlayers(
-          inmates.filter((row) => row && row.isBot !== true && row.usernameHidden !== true).map((row) => row.username),
-          'Jail'
-        );
-      }
-
-      // The jail target rule is intentionally local for speed and to avoid a
-      // high-frequency Cloudflare planner message. It is already visible in the
-      // SSE hot path: highest reward, then shortest sentence. Real inmates are
-      // handled by SSE while connected; GET remains the source for personal bots.
-      const candidates = [];
-      for (const inmate of inmates) {
-        if (!inmate || typeof inmate !== 'object') continue;
-        const username = String(inmate.username || '').trim();
-        const bustToken = String(inmate.bustToken || '').trim();
-        const isBot = inmate.isBot === true;
-        const isSelf = !isBot && (
-          (bustToken && viewerBustToken && bustToken === viewerBustToken)
-          || (!inmate.usernameHidden && username && viewerUsername && normalizePlayerName(username) === normalizePlayerName(viewerUsername))
-        );
-        const target = bustToken || username;
-        const botGeneration = Number(inmate.botGeneration);
-        const validBot = !isBot || (Number.isSafeInteger(botGeneration) && botGeneration >= 1);
-        if (isSelf || !target || target.length > 64 || !validBot) continue;
-        if (jailStreamReady && !isBot) continue;
-        let reward = 0n;
-        try { if (/^\d{1,36}$/.test(String(inmate.bustReward ?? ''))) reward = BigInt(String(inmate.bustReward)); } catch {}
-        const seconds = Number.isFinite(Number(inmate.secondsRemaining)) ? Math.max(0, Number(inmate.secondsRemaining)) : 86_400;
-        candidates.push({ inmate, target, reward, seconds });
-      }
-      candidates.sort((a, b) => a.reward !== b.reward ? (a.reward > b.reward ? -1 : 1) : a.seconds - b.seconds);
-      const candidate = candidates[0] || null;
-
-      if (!candidate) {
-        const waitMs = jailStreamReady ? JAIL_STREAM_FALLBACK_POLL_MS : JAIL_POLL_FALLBACK_MS;
-        state.jailBustDueAt = Date.now() + waitMs;
-        state.currentAction = 'Watching jail';
-        state.jailStatus = `No bust target · checking again in ${formatWait(waitMs)}`;
-        return;
-      }
-
-      const rateWait = Math.max(0, state.lastJailBustAt + JAIL_BUST_MIN_INTERVAL_MS - Date.now());
-      if (rateWait > 0) {
-        state.jailBustDueAt = Date.now() + rateWait;
-        state.jailStatus = `Jailbust rate pacing · ${formatWait(rateWait)}`;
-        return;
-      }
-
-      const inmate = candidate.inmate;
-      const displayName = inmate?.usernameHidden ? 'Unknown' : String(inmate?.username || 'player');
-      state.currentAction = `Busting ${displayName}`;
-      state.jailStatus = state.currentAction;
-      render();
-
-      state.lastJailBustAt = Date.now();
-      let result = null;
-      let error = null;
-      try {
-        result = await gameJson(`/api/jail/bust/${encodeURIComponent(candidate.target)}`, inmate?.isBot === true
-          ? { method: 'POST', body: { generation: Number(inmate.botGeneration) } }
-          : { method: 'POST' });
-        log(cleanGameMessage(result?.html) || `Busted ${displayName}`, result?.success === false ? 'warn' : 'ok');
-      } catch (caught) {
-        if (caught instanceof ActionCancelledError) {
-          state.jailBustDueAt = Date.now() + 250;
-          return;
-        }
-        error = caught;
-        const message = friendlyGameError(caught);
-        const gotCaught = caught?.body?.success === false || /got caught trying to bust|cannot bust players while you are in jail/i.test(message);
-        const stale = caught?.status === 404 || (caught?.status === 400 && /not in jail|no longer in jail|dead|not found/i.test(message));
-        if (gotCaught) {
-          markJailed();
-          log(`Jailbust: ${message}`, 'warn');
-        } else if (!stale) {
-          log(`Jailbust: ${message}`, caught?.status === 429 ? 'warn' : 'error');
-        }
-      }
-
-      const message = error ? friendlyGameError(error) : '';
-      const bustFailed = !!(error && (error?.body?.success === false || /got caught trying to bust|cannot bust players while you are in jail/i.test(message)));
-      const targetStale = !!(error && (error?.status === 404 || (error?.status === 400 && /not in jail|no longer in jail|dead|not found/i.test(message))));
-
-      if (error?.status === 401) {
-        state.currentAction = 'Game login required';
-        state.jailStatus = 'Game session expired · automatic login recovery active';
-        return;
-      }
-
-      if (bustFailed || state.inJail) {
-        markJailed();
-        state.crimesDueAt = Date.now() + CRIME_JAIL_POLL_MS;
-        state.gtaDueAt = Date.now() + CRIME_JAIL_POLL_MS;
-        state.jailBustDueAt = Date.now() + JAIL_RELEASE_POLL_MS;
-        state.currentAction = 'Paused while in jail';
-        state.jailStatus = 'Jailbust failed · waiting for release';
-      } else {
-        const retryAfterMs = error?.status === 429
-          ? (Number(error?.retryAfter) > 0 ? Number(error.retryAfter) * 1000 + 50 : 250)
-          : 0;
-        const serverWait = targetStale || (!error && result?.success !== false) ? 100 : (error ? 1_000 : 100);
-        const localWait = Math.max(0, state.lastJailBustAt + JAIL_BUST_MIN_INTERVAL_MS - Date.now());
-        const waitMs = Math.max(retryAfterMs, serverWait, localWait);
-        state.jailBustDueAt = Date.now() + waitMs;
-        state.currentAction = targetStale ? 'Refreshing jail' : 'Watching jail';
-        state.jailStatus = targetStale
-          ? 'Target left jail · refreshing'
-          : error
-            ? `Jailbust check · retrying in ${formatWait(waitMs)}`
-            : `Jailbust complete · checking again in ${formatWait(waitMs)}`;
-      }
-    } catch (error) {
-      if (error instanceof ActionCancelledError) {
-        state.jailBustDueAt = Date.now() + 250;
-        return;
-      }
-      const waitMs = error?.status === 429 && Number(error?.retryAfter) > 0
-        ? Number(error.retryAfter) * 1000 + 50
-        : (state.inJail ? JAIL_RELEASE_POLL_MS : 1_000);
-      state.jailBustDueAt = Date.now() + waitMs;
-      state.currentAction = 'Jail check failed · waiting to retry';
-      state.jailStatus = `Jail check failed: ${friendlyGameError(error)}`;
-      log(`Jailbust: ${friendlyGameError(error)}`, error?.status === 429 ? 'warn' : 'error');
-      if (error?.status === 401) state.currentAction = 'Game login required';
-    } finally {
-      state.jailBustRunning = false;
-      render();
-    }
-  }
-
-  async function runJailBustStandard() {
+  async function runJailBust() {
     if (!automationAllowed() || (!state.settings.jailBust && !state.inJail) || state.jailBustRunning || state.jailReadRunning) return;
     // Keep the ordinary /api/jail read separate from the actual bust lock. The
     // owner live stream can then dispatch a real-player bust immediately even
@@ -2174,7 +2869,7 @@
           state.playerSearchDueAt = 0;
           state.combatDueAt = 0;
           state.qtDueAt = 0;
-          if (state.settings.jailBust && jailLatestStreamInmates.length) void processLiveJailSnapshot();
+          if (state.settings.jailBust && mergedLiveJailInmates().length) void processLiveJailSnapshot();
         }
       }
 
@@ -2336,15 +3031,10 @@
     } finally {
       state.jailReadRunning = false;
       render();
-      if (state.fastJailEngine && jailStreamShouldRun() && !state.inJail && jailLatestStreamInmates.length) {
+      if (jailStreamShouldRun() && !state.inJail && mergedLiveJailInmates().length) {
         queueMicrotask(() => void processLiveJailSnapshot());
       }
     }
-  }
-
-  async function runJailBust() {
-    if (state.fastJailEngine) return runJailBustLegacyFast();
-    return runJailBustStandard();
   }
 
 
@@ -4915,6 +5605,9 @@
   async function gameJsonDirect(path, options = {}) {
     const method = String(options.method || 'GET').toUpperCase();
     const rateKey = requestRateKey(path, method);
+    const diagnosticFastJailBust = hasFeature(LICENCE_FEATURE.FAST_JAIL_STREAM) && method === 'POST' && isJailBustPath(path);
+    const diagnosticJailRead = hasFeature(LICENCE_FEATURE.FAST_JAIL_STREAM) && method === 'GET' && String(path).split('?')[0] === '/api/jail';
+    const diagnosticCallStartedAt = performance.now();
     const priority = options.priority ?? (method === 'POST' ? REQUEST_PRIORITY.ACTION : REQUEST_PRIORITY.NORMAL);
     const callerValidate = typeof options.validate === 'function' ? options.validate : null;
     const validate = method === 'POST'
@@ -4925,6 +5618,13 @@
       : null;
 
     await reserveRequestSlot(priority, rateKey, validate);
+    const diagnosticAfterQueueAt = performance.now();
+    if (diagnosticFastJailBust) {
+      const wait = Math.max(0, diagnosticAfterQueueAt - diagnosticCallStartedAt);
+      jailDiagnostics.jailBustQueueSamples += 1;
+      jailDiagnostics.jailBustQueueTotalMs += wait;
+      jailDiagnostics.jailBustQueueMaxMs = Math.max(jailDiagnostics.jailBustQueueMaxMs, wait);
+    }
     if (validate) validate();
 
     const controller = new AbortController();
@@ -4942,6 +5642,19 @@
       });
       const type = response.headers.get('content-type') || '';
       body = type.includes('application/json') ? await response.json().catch(() => ({})) : { html: await response.text() };
+      const diagnosticFinishedAt = performance.now();
+      if (diagnosticFastJailBust) {
+        const network = Math.max(0, diagnosticFinishedAt - diagnosticAfterQueueAt);
+        jailDiagnostics.jailBustNetworkSamples += 1;
+        jailDiagnostics.jailBustNetworkTotalMs += network;
+        jailDiagnostics.jailBustNetworkMaxMs = Math.max(jailDiagnostics.jailBustNetworkMaxMs, network);
+      }
+      if (diagnosticJailRead) {
+        const elapsed = Math.max(0, diagnosticFinishedAt - diagnosticCallStartedAt);
+        jailDiagnostics.jailReadSamples += 1;
+        jailDiagnostics.jailReadTotalMs += elapsed;
+        jailDiagnostics.jailReadMaxMs = Math.max(jailDiagnostics.jailReadMaxMs, elapsed);
+      }
     } catch (error) {
       if (error?.name === 'AbortError') {
         const e = new Error(`Request timed out: ${path}`);
@@ -5183,9 +5896,286 @@
     }
   }
 
-  function renderLogs(){const h=document.querySelector('#ul-simple-bot');if(!h)return;h.querySelector('#ul-simple-last').textContent=state.logs[0]?.text||'None yet';const box=h.querySelector('#ul-simple-logs');box.replaceChildren();for(const item of state.logs.slice(0,100)){const d=document.createElement('div');d.className=`ul-simple-log ${item.kind||''}`;d.textContent=`${new Date(item.at).toLocaleTimeString()} · ${item.text}`;box.appendChild(d);}}
+  function averageDiagnostic(total, samples) {
+    return samples > 0 ? Math.round(total / samples) : 0;
+  }
 
-  function log(text,kind='info'){state.logs.unshift({at:Date.now(),text:String(text),kind});state.logs=state.logs.slice(0,100);renderLogs();}
+  function resetJailDiagnostics() {
+    const fresh = {
+      startedAt: Date.now(), streamConnectAttempts:0, streamReady:0, streamSuperseded:0, streamErrors:0,
+      inmateEvents:0, inmateEventServerAgeSamples:0, inmateEventServerAgeTotalMs:0, inmateEventServerAgeMaxMs:0,
+      inmateServerGapSamples:0, inmateServerGapTotalMs:0, inmateServerGapMinMs:0, inmateServerGapMaxMs:0,
+      inmateGapLt250:0, inmateGap250To749:0, inmateGap750To1249:0, inmateGap1250To2249:0, inmateGap2250Plus:0, inmateGapNearWholeSecond:0,
+      attemptNearCadence:0, successNearCadence:0, staleNearCadence:0, attemptOffCadence:0, successOffCadence:0, staleOffCadence:0,
+      inmateSourceInitial:0, inmateSourceSignal:0, inmateSourceWatch:0, inmateSourceUnknown:0,
+      attemptSourceInitial:0, successSourceInitial:0, staleSourceInitial:0,
+      attemptSourceSignal:0, successSourceSignal:0, staleSourceSignal:0,
+      attemptSourceWatch:0, successSourceWatch:0, staleSourceWatch:0,
+      attemptSourceUnknown:0, successSourceUnknown:0, staleSourceUnknown:0,
+      eventSequence:0, lastInmateServerAtMs:0, attemptTrace:[],
+      liveSnapshotsNoCandidate:0, liveSnapshotsBlockedBusy:0, liveSnapshotsBlockedInJail:0, liveSnapshotsRateDeferred:0,
+      liveBustAttempts:0, liveBustSuccess:0, liveBustStale:0, liveBust429:0, liveBustCaught:0, liveBustOtherErrors:0,
+      liveBustRoundTripSamples:0, liveBustRoundTripTotalMs:0, liveBustRoundTripMaxMs:0,
+      liveFreshTargetsSeen:0, liveFreshSelections:0, liveFallbackSelections:0, liveMultiCandidateSelections:0,
+      liveDispatchPrepSamples:0, liveDispatchPrepTotalMs:0, liveDispatchPrepMaxMs:0,
+      liveQueuedTargetDropped:0, liveBurstContinuations:0,
+      liveEventToDispatchSamples:0, liveEventToDispatchTotalMs:0, liveEventToDispatchMaxMs:0,
+      attemptVisible:0, successVisible:0, staleVisible:0, attemptHidden:0, successHidden:0, staleHidden:0,
+      secondarySessionLoginAttempts:0, secondarySessionLoginSuccess:0, secondarySessionLoginErrors:0,
+      secondaryStreamConnectAttempts:0, secondaryStreamReady:0, secondaryStreamErrors:0, secondaryInmateEvents:0,
+      secondaryFreshTargetsSeen:0, secondaryOnlyFreshTargetsSeen:0, secondaryOnlySelections:0, secondaryOnlySuccess:0, secondaryOnlyStale:0,
+      primaryOnlySelections:0, primaryOnlySuccess:0, primaryOnlyStale:0, bothSeenSelections:0, bothSeenSuccess:0, bothSeenStale:0,
+      firstSeenPrimarySelections:0, firstSeenSecondarySelections:0, firstSeenPrimarySuccess:0, firstSeenSecondarySuccess:0, firstSeenPrimaryStale:0, firstSeenSecondaryStale:0,
+      primaryLeadSamples:0, primaryLeadTotalMs:0, primaryLeadMaxMs:0, secondaryLeadSamples:0, secondaryLeadTotalMs:0, secondaryLeadMaxMs:0, streamLeadTies:0, runtimeReloadRestores:0,
+      jailBustQueueSamples:0, jailBustQueueTotalMs:0, jailBustQueueMaxMs:0,
+      jailBustNetworkSamples:0, jailBustNetworkTotalMs:0, jailBustNetworkMaxMs:0,
+      jailReadSamples:0, jailReadTotalMs:0, jailReadMaxMs:0,
+      lastInmateEventAt:0, lastInmateServerTime:'', lastBustAt:0, lastBustStatus:'',
+    };
+    Object.assign(jailDiagnostics, fresh);
+    jailTargetSightings.clear();
+    jailLatestEventMeta = { seq: 0, serverAtMs: 0, serverGapMs: -1, serverAgeMs: -1, nearCadence: false, refreshSource: 'unknown', receivedPerf: 0, hidden: false };
+    persistReloadState();
+  }
+
+  function formatJailDiagnostics() {
+    const now = Date.now();
+    const seconds = Math.max(1, Math.round((now - jailDiagnostics.startedAt) / 1000));
+    return [
+      `UL Bot jail diagnostics · loader v${SCRIPT_VERSION}`,
+      `sampleSeconds=${seconds}`,
+      `fastFeature=${hasFeature(LICENCE_FEATURE.FAST_JAIL_STREAM)}`,
+      `streamReadyNow=${jailStreamReady}`,
+      `streamConnectAttempts=${jailDiagnostics.streamConnectAttempts}`,
+      `streamReadyEvents=${jailDiagnostics.streamReady}`,
+      `streamSuperseded=${jailDiagnostics.streamSuperseded}`,
+      `streamErrors=${jailDiagnostics.streamErrors}`,
+      `inmateEvents=${jailDiagnostics.inmateEvents}`,
+      `inmateServerAgeAvgMs=${averageDiagnostic(jailDiagnostics.inmateEventServerAgeTotalMs,jailDiagnostics.inmateEventServerAgeSamples)}`,
+      `inmateServerAgeMaxMs=${Math.round(jailDiagnostics.inmateEventServerAgeMaxMs)}`,
+      `inmateServerGapAvgMs=${averageDiagnostic(jailDiagnostics.inmateServerGapTotalMs,jailDiagnostics.inmateServerGapSamples)}`,
+      `inmateServerGapMinMs=${Math.round(jailDiagnostics.inmateServerGapMinMs)}`,
+      `inmateServerGapMaxMs=${Math.round(jailDiagnostics.inmateServerGapMaxMs)}`,
+      `inmateGapLt250=${jailDiagnostics.inmateGapLt250}`,
+      `inmateGap250To749=${jailDiagnostics.inmateGap250To749}`,
+      `inmateGap750To1249=${jailDiagnostics.inmateGap750To1249}`,
+      `inmateGap1250To2249=${jailDiagnostics.inmateGap1250To2249}`,
+      `inmateGap2250Plus=${jailDiagnostics.inmateGap2250Plus}`,
+      `inmateGapNearWholeSecond=${jailDiagnostics.inmateGapNearWholeSecond}`,
+      `attemptNearCadence=${jailDiagnostics.attemptNearCadence}`,
+      `successNearCadence=${jailDiagnostics.successNearCadence}`,
+      `staleNearCadence=${jailDiagnostics.staleNearCadence}`,
+      `attemptOffCadence=${jailDiagnostics.attemptOffCadence}`,
+      `successOffCadence=${jailDiagnostics.successOffCadence}`,
+      `staleOffCadence=${jailDiagnostics.staleOffCadence}`,
+      `inmateSourceInitial=${jailDiagnostics.inmateSourceInitial}`,
+      `inmateSourceSignal=${jailDiagnostics.inmateSourceSignal}`,
+      `inmateSourceWatch=${jailDiagnostics.inmateSourceWatch}`,
+      `inmateSourceUnknown=${jailDiagnostics.inmateSourceUnknown}`,
+      `attemptSourceInitial=${jailDiagnostics.attemptSourceInitial}`,
+      `successSourceInitial=${jailDiagnostics.successSourceInitial}`,
+      `staleSourceInitial=${jailDiagnostics.staleSourceInitial}`,
+      `attemptSourceSignal=${jailDiagnostics.attemptSourceSignal}`,
+      `successSourceSignal=${jailDiagnostics.successSourceSignal}`,
+      `staleSourceSignal=${jailDiagnostics.staleSourceSignal}`,
+      `attemptSourceWatch=${jailDiagnostics.attemptSourceWatch}`,
+      `successSourceWatch=${jailDiagnostics.successSourceWatch}`,
+      `staleSourceWatch=${jailDiagnostics.staleSourceWatch}`,
+      `attemptSourceUnknown=${jailDiagnostics.attemptSourceUnknown}`,
+      `successSourceUnknown=${jailDiagnostics.successSourceUnknown}`,
+      `staleSourceUnknown=${jailDiagnostics.staleSourceUnknown}`,
+      `liveNoCandidate=${jailDiagnostics.liveSnapshotsNoCandidate}`,
+      `liveBlockedBusy=${jailDiagnostics.liveSnapshotsBlockedBusy}`,
+      `liveBlockedInJail=${jailDiagnostics.liveSnapshotsBlockedInJail}`,
+      `liveRateDeferred=${jailDiagnostics.liveSnapshotsRateDeferred}`,
+      `liveBustAttempts=${jailDiagnostics.liveBustAttempts}`,
+      `liveBustSuccess=${jailDiagnostics.liveBustSuccess}`,
+      `liveBustStale=${jailDiagnostics.liveBustStale}`,
+      `liveBust429=${jailDiagnostics.liveBust429}`,
+      `liveBustCaught=${jailDiagnostics.liveBustCaught}`,
+      `liveBustOtherErrors=${jailDiagnostics.liveBustOtherErrors}`,
+      `liveBustRoundTripAvgMs=${averageDiagnostic(jailDiagnostics.liveBustRoundTripTotalMs,jailDiagnostics.liveBustRoundTripSamples)}`,
+      `liveBustRoundTripMaxMs=${Math.round(jailDiagnostics.liveBustRoundTripMaxMs)}`,
+      `liveFreshTargetsSeen=${jailDiagnostics.liveFreshTargetsSeen}`,
+      `liveFreshSelections=${jailDiagnostics.liveFreshSelections}`,
+      `liveFallbackSelections=${jailDiagnostics.liveFallbackSelections}`,
+      `liveMultiCandidateSelections=${jailDiagnostics.liveMultiCandidateSelections}`,
+      `liveDispatchPrepAvgMs=${averageDiagnostic(jailDiagnostics.liveDispatchPrepTotalMs,jailDiagnostics.liveDispatchPrepSamples)}`,
+      `liveDispatchPrepMaxMs=${Math.round(jailDiagnostics.liveDispatchPrepMaxMs)}`,
+      `liveQueuedTargetDropped=${jailDiagnostics.liveQueuedTargetDropped}`,
+      `liveBurstContinuations=${jailDiagnostics.liveBurstContinuations}`,
+      `liveEventToDispatchAvgMs=${averageDiagnostic(jailDiagnostics.liveEventToDispatchTotalMs,jailDiagnostics.liveEventToDispatchSamples)}`,
+      `liveEventToDispatchMaxMs=${Math.round(jailDiagnostics.liveEventToDispatchMaxMs)}`,
+      `attemptVisible=${jailDiagnostics.attemptVisible}`,
+      `successVisible=${jailDiagnostics.successVisible}`,
+      `staleVisible=${jailDiagnostics.staleVisible}`,
+      `attemptHidden=${jailDiagnostics.attemptHidden}`,
+      `successHidden=${jailDiagnostics.successHidden}`,
+      `staleHidden=${jailDiagnostics.staleHidden}`,
+      `secondaryEnabled=${jailSecondaryEnabled}`,
+      `secondaryReadyNow=${jailSecondaryReady}`,
+      `secondarySessionLoginAttempts=${jailDiagnostics.secondarySessionLoginAttempts}`,
+      `secondarySessionLoginSuccess=${jailDiagnostics.secondarySessionLoginSuccess}`,
+      `secondarySessionLoginErrors=${jailDiagnostics.secondarySessionLoginErrors}`,
+      `secondaryStreamConnectAttempts=${jailDiagnostics.secondaryStreamConnectAttempts}`,
+      `secondaryStreamReadyEvents=${jailDiagnostics.secondaryStreamReady}`,
+      `secondaryStreamErrors=${jailDiagnostics.secondaryStreamErrors}`,
+      `secondaryInmateEvents=${jailDiagnostics.secondaryInmateEvents}`,
+      `secondaryFreshTargetsSeen=${jailDiagnostics.secondaryFreshTargetsSeen}`,
+      `secondaryOnlyFreshTargetsSeen=${jailDiagnostics.secondaryOnlyFreshTargetsSeen}`,
+      `secondaryOnlySelections=${jailDiagnostics.secondaryOnlySelections}`,
+      `secondaryOnlySuccess=${jailDiagnostics.secondaryOnlySuccess}`,
+      `secondaryOnlyStale=${jailDiagnostics.secondaryOnlyStale}`,
+      `primaryOnlySelections=${jailDiagnostics.primaryOnlySelections}`,
+      `primaryOnlySuccess=${jailDiagnostics.primaryOnlySuccess}`,
+      `primaryOnlyStale=${jailDiagnostics.primaryOnlyStale}`,
+      `bothSeenSelections=${jailDiagnostics.bothSeenSelections}`,
+      `bothSeenSuccess=${jailDiagnostics.bothSeenSuccess}`,
+      `bothSeenStale=${jailDiagnostics.bothSeenStale}`,
+      `firstSeenPrimarySelections=${jailDiagnostics.firstSeenPrimarySelections}`,
+      `firstSeenSecondarySelections=${jailDiagnostics.firstSeenSecondarySelections}`,
+      `firstSeenPrimarySuccess=${jailDiagnostics.firstSeenPrimarySuccess}`,
+      `firstSeenSecondarySuccess=${jailDiagnostics.firstSeenSecondarySuccess}`,
+      `firstSeenPrimaryStale=${jailDiagnostics.firstSeenPrimaryStale}`,
+      `firstSeenSecondaryStale=${jailDiagnostics.firstSeenSecondaryStale}`,
+      `primaryLeadAvgMs=${averageDiagnostic(jailDiagnostics.primaryLeadTotalMs,jailDiagnostics.primaryLeadSamples)}`,
+      `primaryLeadMaxMs=${Math.round(jailDiagnostics.primaryLeadMaxMs)}`,
+      `secondaryLeadAvgMs=${averageDiagnostic(jailDiagnostics.secondaryLeadTotalMs,jailDiagnostics.secondaryLeadSamples)}`,
+      `secondaryLeadMaxMs=${Math.round(jailDiagnostics.secondaryLeadMaxMs)}`,
+      `streamLeadTies=${jailDiagnostics.streamLeadTies}`,
+      `runtimeReloadRestores=${jailDiagnostics.runtimeReloadRestores}`,
+      `jailBustQueueAvgMs=${averageDiagnostic(jailDiagnostics.jailBustQueueTotalMs,jailDiagnostics.jailBustQueueSamples)}`,
+      `jailBustQueueMaxMs=${Math.round(jailDiagnostics.jailBustQueueMaxMs)}`,
+      `jailBustNetworkAvgMs=${averageDiagnostic(jailDiagnostics.jailBustNetworkTotalMs,jailDiagnostics.jailBustNetworkSamples)}`,
+      `jailBustNetworkMaxMs=${Math.round(jailDiagnostics.jailBustNetworkMaxMs)}`,
+      `jailReadAvgMs=${averageDiagnostic(jailDiagnostics.jailReadTotalMs,jailDiagnostics.jailReadSamples)}`,
+      `jailReadMaxMs=${Math.round(jailDiagnostics.jailReadMaxMs)}`,
+      `lastBustStatus=${jailDiagnostics.lastBustStatus || 'none'}`,
+      `lastInmateEventAgoMs=${jailDiagnostics.lastInmateEventAt ? now-jailDiagnostics.lastInmateEventAt : -1}`,
+      `lastBustAgoMs=${jailDiagnostics.lastBustAt ? now-jailDiagnostics.lastBustAt : -1}`,
+      'traceFormat=seq,gapMs,ageMs,cadence,source,firstStream,leadMs,hidden,eventToDispatchMs,candidates,fresh,outcome,roundTripMs',
+      ...jailDiagnostics.attemptTrace.slice(-40).map((row) =>
+        `trace=${row.seq},${Math.round(row.gapMs)},${Math.round(row.ageMs)},${row.cadence},${row.source},${row.firstStream || 'unknown'},${Number.isFinite(Number(row.leadMs)) ? Math.round(Number(row.leadMs)) : -1},${row.hidden},${Math.round(row.eventToDispatchMs)},${row.candidates},${row.fresh},${row.outcome},${Math.round(row.networkMs)}`
+      ),
+    ].join('\n');
+  }
+
+  function loadLogs() {
+    const raw = GM_getValue(KEYS.logs, []);
+    if (!Array.isArray(raw)) return [];
+    return raw.slice(0, 100).flatMap((item) => {
+      if (!item || typeof item !== 'object') return [];
+      const at = Number(item.at);
+      const text = String(item.text || '').slice(0, 1_000);
+      const kind = ['info', 'ok', 'warn', 'error'].includes(String(item.kind || '')) ? String(item.kind) : 'info';
+      if (!Number.isFinite(at) || at <= 0 || !text) return [];
+      return [{ at, text, kind }];
+    });
+  }
+
+  function loadSecondaryJailState() {
+    const raw = GM_getValue(KEYS.secondaryJail, {});
+    const value = raw && typeof raw === 'object' ? raw : {};
+    const token = String(value.token || '').trim();
+    return {
+      enabled: value.enabled === true,
+      token: token.length >= 8 && token.length <= 512 ? token : '',
+    };
+  }
+
+  function persistSecondaryJailState() {
+    GM_setValue(KEYS.secondaryJail, {
+      enabled: jailSecondaryEnabled === true,
+      token: jailSecondaryEnabled ? String(jailSecondaryToken || '') : '',
+    });
+  }
+
+  function restoreJailDiagnosticsFromStorage(target) {
+    const raw = GM_getValue(KEYS.jailDiagnostics, {});
+    if (!raw || typeof raw !== 'object') return;
+    let restored = false;
+    for (const key of Object.keys(target)) {
+      if (!Object.prototype.hasOwnProperty.call(raw, key)) continue;
+      if (key === 'attemptTrace') {
+        if (Array.isArray(raw.attemptTrace)) {
+          target.attemptTrace = raw.attemptTrace.slice(-80).filter((row) => row && typeof row === 'object');
+          restored = true;
+        }
+        continue;
+      }
+      if (typeof target[key] === 'number') {
+        const value = Number(raw[key]);
+        if (Number.isFinite(value) && value >= 0) {
+          target[key] = value;
+          restored = true;
+        }
+      } else if (typeof target[key] === 'string') {
+        target[key] = String(raw[key] || '').slice(0, 250);
+        restored = true;
+      }
+    }
+    // Do not bridge the first post-reload SSE gap to the previous page lifetime.
+    target.lastInmateServerAtMs = 0;
+    if (restored) target.runtimeReloadRestores = (Number(target.runtimeReloadRestores) || 0) + 1;
+  }
+
+  function serialisableJailDiagnostics() {
+    const out = {};
+    for (const [key, value] of Object.entries(jailDiagnostics)) {
+      if (key === 'attemptTrace') out.attemptTrace = Array.isArray(value) ? value.slice(-80) : [];
+      else if (typeof value === 'number' && Number.isFinite(value)) out[key] = value;
+      else if (typeof value === 'string') out[key] = value;
+    }
+    return out;
+  }
+
+  function persistReloadState() {
+    if (runtimePersistTimer) {
+      clearTimeout(runtimePersistTimer);
+      runtimePersistTimer = null;
+    }
+    try { GM_setValue(KEYS.logs, state.logs.slice(0, 100)); } catch {}
+    try { GM_setValue(KEYS.jailDiagnostics, serialisableJailDiagnostics()); } catch {}
+    try { persistSecondaryJailState(); } catch {}
+    try { GM_setValue(KEYS.collapsed, state.collapsed === true); } catch {}
+    try { GM_setValue(KEYS.uiTab, validTab(state.uiTab)); } catch {}
+    try { GM_setValue(KEYS.botTab, state.botTab === true); } catch {}
+  }
+
+  function scheduleRuntimePersist(delay = 5_000) {
+    if (runtimePersistTimer) return;
+    runtimePersistTimer = setTimeout(() => {
+      runtimePersistTimer = null;
+      persistReloadState();
+    }, Math.max(500, Number(delay) || 5_000));
+  }
+
+  function renderLogs(){
+    const h=document.querySelector('#ul-simple-bot');if(!h)return;
+    const diag=h.querySelector('#ul-simple-jail-diag-wrap');
+    const fastJail=hasFeature(LICENCE_FEATURE.FAST_JAIL_STREAM);
+    if(diag)diag.hidden=!fastJail;
+    const secondaryButton=h.querySelector('#ul-simple-jail-secondary-toggle');
+    const secondaryStatus=h.querySelector('#ul-simple-jail-secondary-status');
+    if(secondaryButton){
+      secondaryButton.textContent=jailSecondaryEnabled?'Stop secondary jail stream':'Start secondary jail stream';
+      secondaryButton.disabled=!fastJail || (!jailSecondaryEnabled && (!state.login.email || !state.login.password));
+    }
+    if(secondaryStatus){
+      secondaryStatus.textContent=jailSecondaryEnabled
+        ? `Secondary stream ${jailSecondaryReady?'connected':'starting/reconnecting'} · persists across full page reloads`
+        : (state.login.email && state.login.password
+          ? 'Secondary stream off · optional owner-only test using one additional normal game session.'
+          : 'Secondary stream off · save game login details first to test it.');
+    }
+    h.querySelector('#ul-simple-last').textContent=state.logs[0]?.text||'None yet';
+    const box=h.querySelector('#ul-simple-logs');box.replaceChildren();
+    for(const item of state.logs.slice(0,100)){const d=document.createElement('div');d.className=`ul-simple-log ${item.kind||''}`;d.textContent=`${new Date(item.at).toLocaleTimeString()} · ${item.text}`;box.appendChild(d);}
+  }
+
+  globalThis.__UL_JAIL_DIAGNOSTICS__ = () => formatJailDiagnostics();
+
+  function log(text,kind='info'){state.logs.unshift({at:Date.now(),text:String(text),kind});state.logs=state.logs.slice(0,100);scheduleRuntimePersist();renderLogs();}
   function saveSettings(){
     // Any local automation-setting edit starts a new gameplay generation. This
     // makes a rapid feature OFF -> ON (or target/travel preference edit) unable
@@ -5282,25 +6272,17 @@
     return out;
   }
 
-  function applySessionLicenceFeatures(info) {
-    if (!info || typeof info !== 'object') return;
-    // Successful sessions fail closed: a missing/malformed feature payload must
-    // never preserve a previously selected owner-only engine.
-    const nextFeatures = normaliseLicenceFeatures(
-      Object.prototype.hasOwnProperty.call(info, 'features') ? info.features : []
-    );
-    const nextFastJailEngine = nextFeatures.has(LICENCE_FEATURE.FAST_JAIL_STREAM);
-    const changed = state.fastJailEngine !== nextFastJailEngine;
-    state.licenceFeatures = nextFeatures;
-    state.fastJailEngine = nextFastJailEngine;
-    if (changed) {
-      if (!nextFastJailEngine) stopJailStream();
-      else syncJailStream();
-    }
-  }
-
   function applyVersionInfo(info) {
     if (!info || typeof info !== 'object') return;
+    if (Object.prototype.hasOwnProperty.call(info, 'features')) {
+      const hadFastJail = hasFeature(LICENCE_FEATURE.FAST_JAIL_STREAM);
+      state.licenceFeatures = normaliseLicenceFeatures(info.features);
+      const hasFastJail = hasFeature(LICENCE_FEATURE.FAST_JAIL_STREAM);
+      if (hadFastJail !== hasFastJail) {
+        if (!hasFastJail) stopJailStream();
+        else syncJailStream();
+      }
+    }
     const latest = String(info.latestLoaderVersion || info.botVersion || '').trim();
     const minimum = String(info.minLoaderVersion || '').trim();
     const updateUrl = String(info.updateUrl || '').trim();
